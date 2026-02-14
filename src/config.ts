@@ -35,6 +35,11 @@ export const IDLE_TIMEOUT = parseInt(
   process.env.IDLE_TIMEOUT || '1800000',
   10,
 ); // 30min default — how long to keep container alive after last result
+export const HEAP_LIMIT_MB = parseInt(
+  process.env.HEAP_LIMIT_MB || '1536',
+  10,
+); // Graceful restart threshold
+export const MEMORY_CHECK_INTERVAL = 60_000; // Check every 60s
 export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
@@ -47,6 +52,19 @@ function escapeRegex(str: string): string {
 export const TRIGGER_PATTERN = new RegExp(
   `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
   'i',
+);
+
+// Matrix channel configuration
+export const MATRIX_HOMESERVER = process.env.MATRIX_HOMESERVER || '';
+export const MATRIX_ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN || '';
+export const MATRIX_USER_ID = process.env.MATRIX_USER_ID || '';
+export const MATRIX_USERNAME = process.env.MATRIX_USERNAME || '';
+export const MATRIX_PASSWORD = process.env.MATRIX_PASSWORD || '';
+export const MATRIX_DEVICE_NAME =
+  process.env.MATRIX_DEVICE_NAME || 'nanoclaw-bot';
+export const MATRIX_RECONNECT_INTERVAL = parseInt(
+  process.env.MATRIX_RECONNECT_INTERVAL || '30000',
+  10,
 );
 
 // Timezone for scheduled tasks (cron expressions, etc.)

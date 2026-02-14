@@ -445,6 +445,26 @@ async function runQuery(
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            ...(sdkEnv.HTTP_PROXY
+              ? { HTTP_PROXY: sdkEnv.HTTP_PROXY }
+              : {}),
+            ...(sdkEnv.HTTPS_PROXY
+              ? { HTTPS_PROXY: sdkEnv.HTTPS_PROXY }
+              : {}),
+            ...(sdkEnv.ALL_PROXY ? { ALL_PROXY: sdkEnv.ALL_PROXY } : {}),
+            ...(sdkEnv.NO_PROXY ? { NO_PROXY: sdkEnv.NO_PROXY } : {}),
+            ...(sdkEnv.SSL_CERT_FILE
+              ? { SSL_CERT_FILE: sdkEnv.SSL_CERT_FILE }
+              : {}),
+            ...(sdkEnv.NODE_EXTRA_CA_CERTS
+              ? { NODE_EXTRA_CA_CERTS: sdkEnv.NODE_EXTRA_CA_CERTS }
+              : {}),
+            ...(sdkEnv.NODE_TLS_REJECT_UNAUTHORIZED
+              ? {
+                  NODE_TLS_REJECT_UNAUTHORIZED:
+                    sdkEnv.NODE_TLS_REJECT_UNAUTHORIZED,
+                }
+              : {}),
           },
         },
       },

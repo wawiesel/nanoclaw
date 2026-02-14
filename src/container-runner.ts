@@ -10,6 +10,8 @@ import path from 'path';
 import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
+  CONTAINER_CPUS,
+  CONTAINER_MEMORY_MB,
   CONTAINER_RUNTIME,
   CONTAINER_TIMEOUT,
   DATA_DIR,
@@ -68,6 +70,14 @@ const ALLOWED_ENV_VARS = [
   'OLLAMA_HOST',
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
+  // Network/TLS passthrough for environments with corporate proxies/certs.
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'NO_PROXY',
+  'SSL_CERT_FILE',
+  'NODE_EXTRA_CA_CERTS',
+  'NODE_TLS_REJECT_UNAUTHORIZED',
 ];
 
 function isPodmanRuntime(): boolean {
@@ -232,6 +242,16 @@ function buildVolumeMounts(
     });
   }
 
+  // Share host Gemini login/config with container delegate_gemini runs.
+  const hostGeminiDir = path.join(homeDir, '.gemini');
+  if (fs.existsSync(hostGeminiDir)) {
+    mounts.push({
+      hostPath: hostGeminiDir,
+      containerPath: '/home/node/.gemini',
+      readonly: true,
+    });
+  }
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);
@@ -316,6 +336,12 @@ function buildContainerArgs(mounts: VolumeMount[], containerName: string): strin
   if (isPodmanRuntime()) {
     // Prefer local image for podman: don't pull from remote registries.
     args.push('--pull=never');
+    if (CONTAINER_MEMORY_MB > 0) {
+      args.push('--memory', `${CONTAINER_MEMORY_MB}m`);
+    }
+    if (CONTAINER_CPUS > 0) {
+      args.push('--cpus', String(CONTAINER_CPUS));
+    }
     for (const mount of mounts) {
       args.push(
         '-v',

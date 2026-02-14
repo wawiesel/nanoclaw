@@ -459,6 +459,15 @@ async function runQuery(
             ...(sdkEnv.NODE_EXTRA_CA_CERTS
               ? { NODE_EXTRA_CA_CERTS: sdkEnv.NODE_EXTRA_CA_CERTS }
               : {}),
+            ...(sdkEnv.REQUESTS_CA_BUNDLE
+              ? { REQUESTS_CA_BUNDLE: sdkEnv.REQUESTS_CA_BUNDLE }
+              : {}),
+            ...(sdkEnv.CURL_CA_BUNDLE
+              ? { CURL_CA_BUNDLE: sdkEnv.CURL_CA_BUNDLE }
+              : {}),
+            ...(sdkEnv.GIT_SSL_CAINFO
+              ? { GIT_SSL_CAINFO: sdkEnv.GIT_SSL_CAINFO }
+              : {}),
             ...(sdkEnv.NODE_TLS_REJECT_UNAUTHORIZED
               ? {
                   NODE_TLS_REJECT_UNAUTHORIZED:

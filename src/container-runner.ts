@@ -77,8 +77,18 @@ const ALLOWED_ENV_VARS = [
   'NO_PROXY',
   'SSL_CERT_FILE',
   'NODE_EXTRA_CA_CERTS',
+  'REQUESTS_CA_BUNDLE',
+  'CURL_CA_BUNDLE',
+  'GIT_SSL_CAINFO',
   'NODE_TLS_REJECT_UNAUTHORIZED',
 ];
+const CERT_PATH_ENV_VARS = [
+  'SSL_CERT_FILE',
+  'NODE_EXTRA_CA_CERTS',
+  'REQUESTS_CA_BUNDLE',
+  'CURL_CA_BUNDLE',
+  'GIT_SSL_CAINFO',
+] as const;
 
 function isPodmanRuntime(): boolean {
   return CONTAINER_RUNTIME === 'podman';
@@ -140,6 +150,48 @@ function redactSecrets(
   return Object.fromEntries(
     Object.keys(secrets).map((k) => [k, '[REDACTED]']),
   );
+}
+
+function mapCertPathSecretsToContainer(
+  secrets: Record<string, string>,
+  mounts: VolumeMount[],
+): Record<string, string> {
+  const mapped = { ...secrets };
+  const certMountRoot = '/workspace/host-certs';
+
+  for (const key of CERT_PATH_ENV_VARS) {
+    const value = mapped[key];
+    if (!value) continue;
+    if (!path.isAbsolute(value) || !fs.existsSync(value)) continue;
+
+    const safeName = path.basename(value).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const containerPath = `${certMountRoot}/${key.toLowerCase()}-${safeName}`;
+
+    if (
+      !mounts.some(
+        (m) => m.hostPath === value && m.containerPath === containerPath,
+      )
+    ) {
+      mounts.push({
+        hostPath: value,
+        containerPath,
+        readonly: true,
+      });
+    }
+
+    mapped[key] = containerPath;
+  }
+
+  // Some CLIs (including non-Node networking stacks) honor SSL_CERT_FILE but
+  // ignore NODE_EXTRA_CA_CERTS. Mirror values so delegate tools get both.
+  if (!mapped.SSL_CERT_FILE && mapped.NODE_EXTRA_CA_CERTS) {
+    mapped.SSL_CERT_FILE = mapped.NODE_EXTRA_CA_CERTS;
+  }
+  if (!mapped.NODE_EXTRA_CA_CERTS && mapped.SSL_CERT_FILE) {
+    mapped.NODE_EXTRA_CA_CERTS = mapped.SSL_CERT_FILE;
+  }
+
+  return mapped;
 }
 
 function buildVolumeMounts(
@@ -238,7 +290,7 @@ function buildVolumeMounts(
     mounts.push({
       hostPath: hostCodexDir,
       containerPath: '/home/node/.codex',
-      readonly: true,
+      readonly: false,
     });
   }
 
@@ -248,7 +300,7 @@ function buildVolumeMounts(
     mounts.push({
       hostPath: hostGeminiDir,
       containerPath: '/home/node/.gemini',
-      readonly: true,
+      readonly: false,
     });
   }
 
@@ -378,17 +430,17 @@ export async function runContainerAgent(
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
   const projectRoot = process.cwd();
+  const mounts = buildVolumeMounts(group, input.isMain);
   const secrets = collectContainerSecrets(projectRoot);
+  const mappedSecrets = mapCertPathSecretsToContainer(secrets, mounts);
   const effectiveInput: ContainerInput = {
     ...input,
-    ...(Object.keys(secrets).length > 0 ? { secrets } : {}),
+    ...(Object.keys(mappedSecrets).length > 0 ? { secrets: mappedSecrets } : {}),
   };
   const redactedInputForLog: ContainerInput = {
     ...effectiveInput,
     secrets: redactSecrets(effectiveInput.secrets),
   };
-
-  const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);

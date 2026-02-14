@@ -320,6 +320,50 @@ Use available_groups.json to find the JID for a group. The folder name should be
   },
 );
 
+const ollamaHost = process.env.OLLAMA_HOST || (process.env.NANOCLAW_IPC_DIR ? 'http://localhost:11434' : 'http://host.containers.internal:11434');
+
+server.tool(
+  'query_local_llm',
+  `Query a local Ollama LLM running on the host machine. Use this for tasks that don't need Claude's full reasoning — summarization, formatting, extraction, classification, translation, or simple Q&A. Much faster and free.`,
+  {
+    prompt: z.string().describe('The prompt to send to the local LLM'),
+    model: z.string().default('llama3.2').describe('Ollama model name (e.g., "llama3.2", "mistral", "gemma2")'),
+    system: z.string().optional().describe('Optional system prompt'),
+  },
+  async (args) => {
+    try {
+      const body: Record<string, unknown> = {
+        model: args.model,
+        prompt: args.prompt,
+        stream: false,
+      };
+      if (args.system) body.system = args.system;
+
+      const res = await fetch(`${ollamaHost}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        return {
+          content: [{ type: 'text' as const, text: `Ollama error (${res.status}): ${text}` }],
+          isError: true,
+        };
+      }
+
+      const data = await res.json() as { response: string };
+      return { content: [{ type: 'text' as const, text: data.response }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Failed to reach Ollama at ${ollamaHost}: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
 
 // Start the stdio transport
 const transport = new StdioServerTransport();

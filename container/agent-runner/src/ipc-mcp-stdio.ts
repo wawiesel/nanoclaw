@@ -51,6 +51,27 @@ function emitChatMessage(text: string, sender?: string): void {
   writeIpcFile(MESSAGES_DIR, data);
 }
 
+function guessMimeTypeFromFilename(filename: string): string {
+  const ext = path.extname(filename).toLowerCase();
+  const mimeMap: Record<string, string> = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.svg': 'image/svg+xml',
+    '.pdf': 'application/pdf',
+    '.txt': 'text/plain',
+    '.md': 'text/markdown',
+    '.csv': 'text/csv',
+    '.json': 'application/json',
+    '.zip': 'application/zip',
+    '.tar': 'application/x-tar',
+    '.gz': 'application/gzip',
+  };
+  return mimeMap[ext] || 'application/octet-stream';
+}
+
 function resolveDelegateCwd(cwd?: string): { ok: true; cwd: string } | { ok: false; error: string } {
   const requested = cwd?.trim() || '/workspace/group';
   const resolved = path.isAbsolute(requested)
@@ -140,16 +161,7 @@ server.tool(
 
     const imageData = fs.readFileSync(args.file_path).toString('base64');
     const filename = path.basename(args.file_path);
-    const ext = path.extname(filename).toLowerCase();
-    const mimeMap: Record<string, string> = {
-      '.png': 'image/png',
-      '.jpg': 'image/jpeg',
-      '.jpeg': 'image/jpeg',
-      '.gif': 'image/gif',
-      '.webp': 'image/webp',
-      '.svg': 'image/svg+xml',
-    };
-    const mimetype = mimeMap[ext] || 'application/octet-stream';
+    const mimetype = guessMimeTypeFromFilename(filename);
 
     writeIpcFile(MESSAGES_DIR, {
       type: 'image',
@@ -163,6 +175,40 @@ server.tool(
     });
 
     return { content: [{ type: 'text' as const, text: 'Image sent.' }] };
+  },
+);
+
+server.tool(
+  'send_file',
+  'Send a file attachment to the user or group. The file must exist in the container filesystem (e.g. /workspace/group/report.pdf).',
+  {
+    file_path: z.string().describe('Absolute path to the file in the container'),
+    caption: z.string().optional().describe('Optional message to send after the file'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.file_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }],
+        isError: true,
+      };
+    }
+
+    const fileData = fs.readFileSync(args.file_path).toString('base64');
+    const filename = path.basename(args.file_path);
+    const mimetype = guessMimeTypeFromFilename(filename);
+
+    writeIpcFile(MESSAGES_DIR, {
+      type: 'file',
+      chatJid,
+      fileData,
+      filename,
+      mimetype,
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { content: [{ type: 'text' as const, text: 'File sent.' }] };
   },
 );
 

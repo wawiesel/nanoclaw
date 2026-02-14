@@ -24,6 +24,8 @@ const DEFAULT_DELEGATE_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_DELEGATE_TIMEOUT_MS = 60 * 60 * 1000;
 const DELEGATE_CWD_ROOTS = ['/workspace/group', '/workspace/extra'];
 const DELEGATE_CACHE_ROOT = '/workspace/cache';
+const HOST_CERT_FALLBACK = '/workspace/host-certs/node_extra_ca_certs-corporate-certs.pem';
+type DelegateEnv = Record<string, string | undefined>;
 
 function writeIpcFile(dir: string, data: object): string {
   fs.mkdirSync(dir, { recursive: true });
@@ -125,19 +127,12 @@ function isProviderUnavailableError(line: string): boolean {
   ].some((needle) => s.includes(needle));
 }
 
-function commandExists(command: string): boolean {
-  const pathValue = process.env.PATH || '';
-  const dirs = pathValue.split(path.delimiter).filter(Boolean);
-  for (const dir of dirs) {
-    const candidate = path.join(dir, command);
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return true;
-    } catch {
-      // Continue searching
-    }
-  }
-  return false;
+function isIgnorableDelegateStderr(line: string): boolean {
+  const s = line.toLowerCase();
+  return (
+    s.includes('node_tls_reject_unauthorized') &&
+    s.includes('makes tls connections and https requests insecure')
+  );
 }
 
 function formatDelegateSender(
@@ -146,8 +141,56 @@ function formatDelegateSender(
   llm: string,
 ): string {
   const base = name.trim();
-  const model = (llm || 'auto').trim() || 'auto';
+  const model = llm.trim();
   return `${base}(${provider},${model})`;
+}
+
+function firstSet(...values: Array<string | undefined>): string | undefined {
+  for (const v of values) {
+    const s = v?.trim();
+    if (s) return s;
+  }
+  return undefined;
+}
+
+function buildDelegateEnv(): DelegateEnv {
+  const delegateEnv: DelegateEnv = {
+    ...process.env,
+    XDG_CACHE_HOME: process.env.XDG_CACHE_HOME || DELEGATE_CACHE_ROOT,
+    PIP_CACHE_DIR: process.env.PIP_CACHE_DIR || `${DELEGATE_CACHE_ROOT}/pip`,
+    UV_CACHE_DIR: process.env.UV_CACHE_DIR || `${DELEGATE_CACHE_ROOT}/uv`,
+    HF_HOME: process.env.HF_HOME || `${DELEGATE_CACHE_ROOT}/huggingface`,
+    TRANSFORMERS_CACHE:
+      process.env.TRANSFORMERS_CACHE || `${DELEGATE_CACHE_ROOT}/huggingface`,
+    VIRTUALENV_OVERRIDE_APP_DATA:
+      process.env.VIRTUALENV_OVERRIDE_APP_DATA ||
+      `${DELEGATE_CACHE_ROOT}/virtualenv`,
+  };
+
+  if (fs.existsSync(HOST_CERT_FALLBACK)) {
+    if (!delegateEnv.NODE_EXTRA_CA_CERTS) {
+      delegateEnv.NODE_EXTRA_CA_CERTS = HOST_CERT_FALLBACK;
+    }
+    if (!delegateEnv.SSL_CERT_FILE) {
+      delegateEnv.SSL_CERT_FILE = HOST_CERT_FALLBACK;
+    }
+  }
+
+  fs.mkdirSync(DELEGATE_CACHE_ROOT, { recursive: true });
+  return delegateEnv;
+}
+
+function spawnNpxDelegate(
+  pkg: string,
+  args: string[],
+  cwd: string,
+  env: DelegateEnv,
+): ReturnType<typeof spawn> {
+  return spawn('npx', ['-y', pkg, ...args], {
+    cwd,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
 }
 
 const server = new McpServer({
@@ -475,10 +518,13 @@ Behavior:
       .describe('Hard timeout for the delegate run in milliseconds (default 900000, max 3600000).'),
   },
   async (args) => {
+    const effectiveModel =
+      firstSet(args.model, process.env.CODEX_MODEL, process.env.OPENAI_MODEL) ||
+      'gpt-5-codex';
     const delegateSender = formatDelegateSender(
       args.name,
       'codex',
-      args.model || 'default',
+      effectiveModel,
     );
     const cwdResult = resolveDelegateCwd(args.cwd);
     if (!cwdResult.ok) {
@@ -503,9 +549,7 @@ Behavior:
       '--cd',
       cwdResult.cwd,
     ];
-    if (args.model) {
-      codexArgs.push('--model', args.model);
-    }
+    codexArgs.push('--model', effectiveModel);
     const delegatedObjective = [
       'Execution constraints:',
       '- Do NOT create Python virtual environments inside /workspace/group or /workspace/extra.',
@@ -587,6 +631,7 @@ Behavior:
       const handleStderrLine = (line: string) => {
         const trimmed = line.trim();
         if (!trimmed) return;
+        if (isIgnorableDelegateStderr(trimmed)) return;
         stderrLines.push(trimmed);
         if (stderrLines.length > 100) stderrLines.shift();
         if (!unavailableTriggered && isProviderUnavailableError(trimmed)) {
@@ -595,27 +640,13 @@ Behavior:
       };
 
       try {
-        const delegateEnv = {
-          ...process.env,
-          XDG_CACHE_HOME: process.env.XDG_CACHE_HOME || DELEGATE_CACHE_ROOT,
-          PIP_CACHE_DIR:
-            process.env.PIP_CACHE_DIR || `${DELEGATE_CACHE_ROOT}/pip`,
-          UV_CACHE_DIR: process.env.UV_CACHE_DIR || `${DELEGATE_CACHE_ROOT}/uv`,
-          HF_HOME:
-            process.env.HF_HOME || `${DELEGATE_CACHE_ROOT}/huggingface`,
-          TRANSFORMERS_CACHE:
-            process.env.TRANSFORMERS_CACHE ||
-            `${DELEGATE_CACHE_ROOT}/huggingface`,
-          VIRTUALENV_OVERRIDE_APP_DATA:
-            process.env.VIRTUALENV_OVERRIDE_APP_DATA ||
-            `${DELEGATE_CACHE_ROOT}/virtualenv`,
-        };
-        fs.mkdirSync(DELEGATE_CACHE_ROOT, { recursive: true });
-        proc = spawn('codex', codexArgs, {
-          cwd: cwdResult.cwd,
-          env: delegateEnv,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
+        const delegateEnv = buildDelegateEnv();
+        proc = spawnNpxDelegate(
+          '@openai/codex',
+          codexArgs,
+          cwdResult.cwd,
+          delegateEnv,
+        );
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         const unavailable = `unavailable: ${reason}`;
@@ -741,10 +772,12 @@ Behavior:
       .describe('Hard timeout for the delegate run in milliseconds (default 900000, max 3600000).'),
   },
   async (args) => {
+    const effectiveModel =
+      firstSet(args.model, process.env.GEMINI_MODEL) || 'gemini-2.5-pro';
     const delegateSender = formatDelegateSender(
       args.name,
       'gemini',
-      args.model || 'default',
+      effectiveModel,
     );
     const cwdResult = resolveDelegateCwd(args.cwd);
     if (!cwdResult.ok) {
@@ -778,9 +811,7 @@ Behavior:
       '--output-format',
       'text',
     ];
-    if (args.model) {
-      geminiArgs.push('--model', args.model);
-    }
+    geminiArgs.push('--model', effectiveModel);
 
     return await new Promise<
       { content: Array<{ type: 'text'; text: string }>; isError?: boolean }
@@ -827,6 +858,7 @@ Behavior:
       const handleStderrLine = (line: string) => {
         const trimmed = line.trim();
         if (!trimmed) return;
+        if (isIgnorableDelegateStderr(trimmed)) return;
         stderrLines.push(trimmed);
         if (stderrLines.length > 100) stderrLines.shift();
         if (!unavailableTriggered && isProviderUnavailableError(trimmed)) {
@@ -835,32 +867,13 @@ Behavior:
       };
 
       try {
-        const delegateEnv = {
-          ...process.env,
-          XDG_CACHE_HOME: process.env.XDG_CACHE_HOME || DELEGATE_CACHE_ROOT,
-          PIP_CACHE_DIR:
-            process.env.PIP_CACHE_DIR || `${DELEGATE_CACHE_ROOT}/pip`,
-          UV_CACHE_DIR: process.env.UV_CACHE_DIR || `${DELEGATE_CACHE_ROOT}/uv`,
-          HF_HOME:
-            process.env.HF_HOME || `${DELEGATE_CACHE_ROOT}/huggingface`,
-          TRANSFORMERS_CACHE:
-            process.env.TRANSFORMERS_CACHE ||
-            `${DELEGATE_CACHE_ROOT}/huggingface`,
-          VIRTUALENV_OVERRIDE_APP_DATA:
-            process.env.VIRTUALENV_OVERRIDE_APP_DATA ||
-            `${DELEGATE_CACHE_ROOT}/virtualenv`,
-        };
-        fs.mkdirSync(DELEGATE_CACHE_ROOT, { recursive: true });
-        const useNativeGemini = commandExists('gemini');
-        const runCmd = useNativeGemini ? 'gemini' : 'npx';
-        const runArgs = useNativeGemini
-          ? geminiArgs
-          : ['-y', '@google/gemini-cli', ...geminiArgs];
-        proc = spawn(runCmd, runArgs, {
-          cwd: cwdResult.cwd,
-          env: delegateEnv,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
+        const delegateEnv = buildDelegateEnv();
+        proc = spawnNpxDelegate(
+          '@google/gemini-cli',
+          geminiArgs,
+          cwdResult.cwd,
+          delegateEnv,
+        );
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         const unavailable = `unavailable: ${reason}`;

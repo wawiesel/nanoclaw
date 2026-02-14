@@ -11,7 +11,7 @@ import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 
-const IPC_DIR = '/workspace/ipc';
+const IPC_DIR = process.env.NANOCLAW_IPC_DIR || '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 
@@ -34,6 +34,18 @@ function writeIpcFile(dir: string, data: object): string {
   return filename;
 }
 
+function emitChatMessage(text: string, sender?: string): void {
+  const data: Record<string, string | undefined> = {
+    type: 'message',
+    chatJid,
+    text,
+    sender: sender || undefined,
+    groupFolder,
+    timestamp: new Date().toISOString(),
+  };
+  writeIpcFile(MESSAGES_DIR, data);
+}
+
 const server = new McpServer({
   name: 'nanoclaw',
   version: '1.0.0',
@@ -47,18 +59,52 @@ server.tool(
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
   },
   async (args) => {
-    const data: Record<string, string | undefined> = {
-      type: 'message',
-      chatJid,
-      text: args.text,
-      sender: args.sender || undefined,
-      groupFolder,
-      timestamp: new Date().toISOString(),
-    };
-
-    writeIpcFile(MESSAGES_DIR, data);
+    emitChatMessage(args.text, args.sender);
 
     return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+  },
+);
+
+server.tool(
+  'send_image',
+  'Send an image file to the user or group. The file must exist in the container filesystem (e.g. /workspace/group/screenshot.png). Supports PNG, JPEG, GIF, WebP.',
+  {
+    file_path: z.string().describe('Absolute path to the image file in the container'),
+    caption: z.string().optional().describe('Optional caption to display with the image'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.file_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }],
+        isError: true,
+      };
+    }
+
+    const imageData = fs.readFileSync(args.file_path).toString('base64');
+    const filename = path.basename(args.file_path);
+    const ext = path.extname(filename).toLowerCase();
+    const mimeMap: Record<string, string> = {
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif',
+      '.webp': 'image/webp',
+      '.svg': 'image/svg+xml',
+    };
+    const mimetype = mimeMap[ext] || 'application/octet-stream';
+
+    writeIpcFile(MESSAGES_DIR, {
+      type: 'image',
+      chatJid,
+      imageData,
+      filename,
+      mimetype,
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { content: [{ type: 'text' as const, text: 'Image sent.' }] };
   },
 );
 
@@ -273,6 +319,7 @@ Use available_groups.json to find the JID for a group. The folder name should be
     };
   },
 );
+
 
 // Start the stdio transport
 const transport = new StdioServerTransport();

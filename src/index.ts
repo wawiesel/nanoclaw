@@ -700,6 +700,12 @@ async function main(): Promise<void> {
       logger.warn({ jid }, 'No channel with image support found for IPC image');
       return Promise.resolve();
     },
+    sendFile: (jid, buffer, filename, mimetype, caption) => {
+      const ch = findChannel(channels, jid);
+      if (ch?.sendFile) return ch.sendFile(jid, buffer, filename, mimetype, caption);
+      logger.warn({ jid }, 'No channel with file support found for IPC file');
+      return Promise.resolve();
+    },
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroupMetadata: async () => {},

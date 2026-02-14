@@ -17,6 +17,7 @@ import { RegisteredGroup } from './types.js';
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   sendImage: (jid: string, buffer: Buffer, filename: string, mimetype: string, caption?: string) => Promise<void>;
+  sendFile: (jid: string, buffer: Buffer, filename: string, mimetype: string, caption?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -114,6 +115,26 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC image attempt blocked',
+                  );
+                }
+              } else if (data.type === 'file' && data.chatJid && data.fileData) {
+                if (authorized) {
+                  const buffer = Buffer.from(data.fileData, 'base64');
+                  await deps.sendFile(
+                    data.chatJid,
+                    buffer,
+                    data.filename || 'attachment.bin',
+                    data.mimetype || 'application/octet-stream',
+                    data.caption,
+                  );
+                  logger.info(
+                    { chatJid: data.chatJid, sourceGroup, filename: data.filename },
+                    'IPC file sent',
+                  );
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC file attempt blocked',
                   );
                 }
               }

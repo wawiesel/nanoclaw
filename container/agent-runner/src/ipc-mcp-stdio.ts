@@ -125,6 +125,31 @@ function isProviderUnavailableError(line: string): boolean {
   ].some((needle) => s.includes(needle));
 }
 
+function commandExists(command: string): boolean {
+  const pathValue = process.env.PATH || '';
+  const dirs = pathValue.split(path.delimiter).filter(Boolean);
+  for (const dir of dirs) {
+    const candidate = path.join(dir, command);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return true;
+    } catch {
+      // Continue searching
+    }
+  }
+  return false;
+}
+
+function formatDelegateSender(
+  name: string,
+  provider: 'codex' | 'gemini' | 'ollama',
+  llm: string,
+): string {
+  const base = name.trim();
+  const model = (llm || 'auto').trim() || 'auto';
+  return `${base}(${provider},${model})`;
+}
+
 const server = new McpServer({
   name: 'nanoclaw',
   version: '1.0.0',
@@ -437,6 +462,7 @@ Behavior:
   "codex: unavailable: ..."
 `,
   {
+    name: z.string().min(1).describe('Display name for this delegate instance (provided by johnny5-bot, e.g. "Renamer").'),
     objective: z.string().describe('Task for Codex to execute'),
     cwd: z.string().optional().describe('Working directory (absolute, or relative to /workspace/group). Must stay under /workspace/group or /workspace/extra.'),
     model: z.string().optional().describe('Optional Codex model override (e.g. "o3").'),
@@ -449,10 +475,15 @@ Behavior:
       .describe('Hard timeout for the delegate run in milliseconds (default 900000, max 3600000).'),
   },
   async (args) => {
+    const delegateSender = formatDelegateSender(
+      args.name,
+      'codex',
+      args.model || 'default',
+    );
     const cwdResult = resolveDelegateCwd(args.cwd);
     if (!cwdResult.ok) {
       const unavailable = `unavailable: ${cwdResult.error}`;
-      emitChatMessage(unavailable, 'codex');
+      emitChatMessage(unavailable, delegateSender);
       return {
         content: [{ type: 'text' as const, text: `codex: ${unavailable}` }],
         isError: true,
@@ -510,7 +541,7 @@ Behavior:
         const normalized = text.replace(/\r/g, '').trim();
         if (!normalized) return;
         prefixedMessages.push(`codex: ${normalized}`);
-        emitChatMessage(normalized, 'codex');
+        emitChatMessage(normalized, delegateSender);
       };
 
       const failUnavailable = (reason: string) => {
@@ -588,7 +619,7 @@ Behavior:
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         const unavailable = `unavailable: ${reason}`;
-        emitChatMessage(unavailable, 'codex');
+        emitChatMessage(unavailable, delegateSender);
         finalize({
           content: [{ type: 'text', text: `codex: ${unavailable}` }],
           isError: true,
@@ -684,7 +715,341 @@ Behavior:
   },
 );
 
+server.tool(
+  'delegate_gemini',
+  `Delegate a coding objective to Gemini CLI in the same mounted workspace.
+
+Use this when you want Gemini CLI to directly read/write files and run commands (including Python) inside the container.
+
+Behavior:
+- Streams Gemini assistant text back to chat prefixed as "gemini: ..."
+- Returns the exact same prefixed text to the main agent
+- If Gemini cannot run (auth/quota/rate-limit/provider errors), it fails immediately and emits:
+  "gemini: unavailable: ..."
+`,
+  {
+    name: z.string().min(1).describe('Display name for this delegate instance (provided by johnny5-bot, e.g. "Reviewer").'),
+    objective: z.string().describe('Task for Gemini to execute'),
+    cwd: z.string().optional().describe('Working directory (absolute, or relative to /workspace/group). Must stay under /workspace/group or /workspace/extra.'),
+    model: z.string().optional().describe('Optional Gemini model override (e.g. "gemini-2.5-pro").'),
+    timeout_ms: z
+      .number()
+      .int()
+      .positive()
+      .max(MAX_DELEGATE_TIMEOUT_MS)
+      .default(DEFAULT_DELEGATE_TIMEOUT_MS)
+      .describe('Hard timeout for the delegate run in milliseconds (default 900000, max 3600000).'),
+  },
+  async (args) => {
+    const delegateSender = formatDelegateSender(
+      args.name,
+      'gemini',
+      args.model || 'default',
+    );
+    const cwdResult = resolveDelegateCwd(args.cwd);
+    if (!cwdResult.ok) {
+      const unavailable = `unavailable: ${cwdResult.error}`;
+      emitChatMessage(unavailable, delegateSender);
+      return {
+        content: [{ type: 'text' as const, text: `gemini: ${unavailable}` }],
+        isError: true,
+      };
+    }
+
+    const timeoutMs = Math.max(
+      1000,
+      Math.min(args.timeout_ms ?? DEFAULT_DELEGATE_TIMEOUT_MS, MAX_DELEGATE_TIMEOUT_MS),
+    );
+
+    const delegatedObjective = [
+      'Execution constraints:',
+      '- Do NOT create Python virtual environments inside /workspace/group or /workspace/extra.',
+      '- If a Python environment is required, create it under /workspace/cache/venvs.',
+      '- Route large model/package caches under /workspace/cache.',
+      '',
+      'Objective:',
+      args.objective,
+    ].join('\n');
+
+    const geminiArgs = [
+      '--prompt',
+      delegatedObjective,
+      '--yolo',
+      '--output-format',
+      'text',
+    ];
+    if (args.model) {
+      geminiArgs.push('--model', args.model);
+    }
+
+    return await new Promise<
+      { content: Array<{ type: 'text'; text: string }>; isError?: boolean }
+    >((resolve) => {
+      const prefixedMessages: string[] = [];
+      const stderrLines: string[] = [];
+      let stdoutBuffer = '';
+      let stderrBuffer = '';
+      let finalized = false;
+      let unavailableTriggered = false;
+      let timedOut = false;
+      let proc: ReturnType<typeof spawn> | null = null;
+
+      const finalize = (
+        payload: { content: Array<{ type: 'text'; text: string }>; isError?: boolean },
+      ) => {
+        if (finalized) return;
+        finalized = true;
+        resolve(payload);
+      };
+
+      const pushMessage = (text: string) => {
+        const normalized = text.replace(/\r/g, '').trim();
+        if (!normalized) return;
+        prefixedMessages.push(`gemini: ${normalized}`);
+        emitChatMessage(normalized, delegateSender);
+      };
+
+      const failUnavailable = (reason: string) => {
+        if (unavailableTriggered) return;
+        unavailableTriggered = true;
+        pushMessage(`unavailable: ${reason}`);
+        if (proc && proc.exitCode === null) {
+          proc.kill('SIGTERM');
+        }
+      };
+
+      const handleStdoutLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        pushMessage(trimmed);
+      };
+
+      const handleStderrLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        stderrLines.push(trimmed);
+        if (stderrLines.length > 100) stderrLines.shift();
+        if (!unavailableTriggered && isProviderUnavailableError(trimmed)) {
+          failUnavailable(trimmed);
+        }
+      };
+
+      try {
+        const delegateEnv = {
+          ...process.env,
+          XDG_CACHE_HOME: process.env.XDG_CACHE_HOME || DELEGATE_CACHE_ROOT,
+          PIP_CACHE_DIR:
+            process.env.PIP_CACHE_DIR || `${DELEGATE_CACHE_ROOT}/pip`,
+          UV_CACHE_DIR: process.env.UV_CACHE_DIR || `${DELEGATE_CACHE_ROOT}/uv`,
+          HF_HOME:
+            process.env.HF_HOME || `${DELEGATE_CACHE_ROOT}/huggingface`,
+          TRANSFORMERS_CACHE:
+            process.env.TRANSFORMERS_CACHE ||
+            `${DELEGATE_CACHE_ROOT}/huggingface`,
+          VIRTUALENV_OVERRIDE_APP_DATA:
+            process.env.VIRTUALENV_OVERRIDE_APP_DATA ||
+            `${DELEGATE_CACHE_ROOT}/virtualenv`,
+        };
+        fs.mkdirSync(DELEGATE_CACHE_ROOT, { recursive: true });
+        const useNativeGemini = commandExists('gemini');
+        const runCmd = useNativeGemini ? 'gemini' : 'npx';
+        const runArgs = useNativeGemini
+          ? geminiArgs
+          : ['-y', '@google/gemini-cli', ...geminiArgs];
+        proc = spawn(runCmd, runArgs, {
+          cwd: cwdResult.cwd,
+          env: delegateEnv,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        const unavailable = `unavailable: ${reason}`;
+        emitChatMessage(unavailable, delegateSender);
+        finalize({
+          content: [{ type: 'text', text: `gemini: ${unavailable}` }],
+          isError: true,
+        });
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        failUnavailable(`timed out after ${timeoutMs}ms`);
+      }, timeoutMs);
+
+      proc.stdout!.on('data', (chunk: Buffer | string) => {
+        stdoutBuffer += chunk.toString();
+        while (true) {
+          const idx = stdoutBuffer.indexOf('\n');
+          if (idx === -1) break;
+          const line = stdoutBuffer.slice(0, idx);
+          stdoutBuffer = stdoutBuffer.slice(idx + 1);
+          handleStdoutLine(line);
+        }
+      });
+
+      proc.stderr!.on('data', (chunk: Buffer | string) => {
+        stderrBuffer += chunk.toString();
+        while (true) {
+          const idx = stderrBuffer.indexOf('\n');
+          if (idx === -1) break;
+          const line = stderrBuffer.slice(0, idx);
+          stderrBuffer = stderrBuffer.slice(idx + 1);
+          handleStderrLine(line);
+        }
+      });
+
+      proc.on('error', (err) => {
+        clearTimeout(timer);
+        failUnavailable(err.message);
+        finalize({
+          content: [
+            {
+              type: 'text',
+              text:
+                prefixedMessages.join('\n\n') ||
+                `gemini: unavailable: ${err.message}`,
+            },
+          ],
+          isError: true,
+        });
+      });
+
+      proc.on('close', (code, signal) => {
+        clearTimeout(timer);
+
+        if (stdoutBuffer.trim()) handleStdoutLine(stdoutBuffer);
+        if (stderrBuffer.trim()) handleStderrLine(stderrBuffer);
+
+        if (timedOut || unavailableTriggered) {
+          finalize({
+            content: [
+              {
+                type: 'text',
+                text:
+                  prefixedMessages.join('\n\n') ||
+                  'gemini: unavailable',
+              },
+            ],
+            isError: true,
+          });
+          return;
+        }
+
+        if (code !== 0) {
+          const detail =
+            stderrLines[stderrLines.length - 1] ||
+            `gemini exited with code ${code}${signal ? ` (signal: ${signal})` : ''}`;
+          failUnavailable(detail);
+          finalize({
+            content: [{ type: 'text', text: prefixedMessages.join('\n\n') }],
+            isError: true,
+          });
+          return;
+        }
+
+        if (prefixedMessages.length === 0) {
+          prefixedMessages.push('gemini: completed with no textual output.');
+        }
+
+        finalize({
+          content: [{ type: 'text', text: prefixedMessages.join('\n\n') }],
+        });
+      });
+    });
+  },
+);
+
 const ollamaHost = process.env.OLLAMA_HOST || (process.env.NANOCLAW_IPC_DIR ? 'http://localhost:11434' : 'http://host.containers.internal:11434');
+
+server.tool(
+  'delegate_ollama',
+  `Delegate an objective to a local Ollama model on the host machine.
+
+Behavior:
+- Sends the objective to Ollama and returns output prefixed as "ollama: ..."
+- Emits the same prefixed text to chat immediately
+- On connection/auth/runtime errors, returns:
+  "ollama: unavailable: ..."
+`,
+  {
+    name: z.string().min(1).describe('Display name for this delegate instance (provided by johnny5-bot, e.g. "Summarizer").'),
+    objective: z.string().describe('Task/objective for Ollama to execute'),
+    model: z.string().default('llama3.2').describe('Ollama model name'),
+    system: z.string().optional().describe('Optional system prompt'),
+    timeout_ms: z
+      .number()
+      .int()
+      .positive()
+      .max(MAX_DELEGATE_TIMEOUT_MS)
+      .default(DEFAULT_DELEGATE_TIMEOUT_MS)
+      .describe('Hard timeout for the delegate run in milliseconds (default 900000, max 3600000).'),
+  },
+  async (args) => {
+    const delegateSender = formatDelegateSender(
+      args.name,
+      'ollama',
+      args.model,
+    );
+    const timeoutMs = Math.max(
+      1000,
+      Math.min(args.timeout_ms ?? DEFAULT_DELEGATE_TIMEOUT_MS, MAX_DELEGATE_TIMEOUT_MS),
+    );
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const body: Record<string, unknown> = {
+        model: args.model,
+        prompt: args.objective,
+        stream: false,
+      };
+      if (args.system) body.system = args.system;
+
+      const res = await fetch(`${ollamaHost}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        const unavailable = `unavailable: Ollama error (${res.status}): ${text}`;
+        emitChatMessage(unavailable, delegateSender);
+        return {
+          content: [{ type: 'text' as const, text: `ollama: ${unavailable}` }],
+          isError: true,
+        };
+      }
+
+      const data = await res.json() as { response?: string };
+      const responseText = (data.response || '').trim();
+      if (!responseText) {
+        const doneText = 'completed with no textual output.';
+        emitChatMessage(doneText, delegateSender);
+        return {
+          content: [{ type: 'text' as const, text: `ollama: ${doneText}` }],
+        };
+      }
+
+      emitChatMessage(responseText, delegateSender);
+      return {
+        content: [{ type: 'text' as const, text: `ollama: ${responseText}` }],
+      };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      const unavailable = `unavailable: ${reason}`;
+      emitChatMessage(unavailable, delegateSender);
+      return {
+        content: [{ type: 'text' as const, text: `ollama: ${unavailable}` }],
+        isError: true,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+);
 
 server.tool(
   'query_local_llm',

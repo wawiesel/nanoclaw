@@ -4,6 +4,7 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  CONTAINER_RUNTIME,
   DATA_DIR,
   GROUPS_DIR,
   HEAP_LIMIT_MB,
@@ -477,6 +478,62 @@ function recoverPendingMessages(): void {
 }
 
 function ensureContainerSystemRunning(): void {
+  if (CONTAINER_RUNTIME === 'podman') {
+    try {
+      execSync('podman info', { stdio: 'pipe' });
+      logger.debug('Podman runtime available');
+    } catch (err) {
+      logger.error({ err }, 'Podman runtime unavailable');
+      console.error(
+        '\n╔════════════════════════════════════════════════════════════════╗',
+      );
+      console.error(
+        '║  FATAL: Podman is required but unavailable                     ║',
+      );
+      console.error(
+        '║                                                                ║',
+      );
+      console.error(
+        '║  Ensure podman machine is running and podman is in PATH.       ║',
+      );
+      console.error(
+        '║  Then restart NanoClaw.                                        ║',
+      );
+      console.error(
+        '╚════════════════════════════════════════════════════════════════╝\n',
+      );
+      throw new Error('Podman is required but not available');
+    }
+
+    try {
+      const output = execSync('podman ps --format json', {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        encoding: 'utf-8',
+      });
+      const containers: Array<{ Names?: string[] | string }> = JSON.parse(
+        output || '[]',
+      );
+      const names = containers.flatMap((c) => {
+        if (Array.isArray(c.Names)) return c.Names;
+        return c.Names ? [c.Names] : [];
+      });
+      const orphans = names.filter((n) => n.startsWith('nanoclaw-'));
+      for (const name of orphans) {
+        try {
+          execSync(`podman stop ${name}`, { stdio: 'pipe' });
+        } catch {
+          // Best-effort cleanup
+        }
+      }
+      if (orphans.length > 0) {
+        logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned podman containers');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to clean up orphaned podman containers');
+    }
+    return;
+  }
+
   try {
     execSync('container system status', { stdio: 'pipe' });
     logger.debug('Apple Container system already running');

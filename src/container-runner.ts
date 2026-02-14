@@ -1,6 +1,6 @@
 /**
  * Container Runner for NanoClaw
- * Spawns agent execution in Apple Container and handles IPC
+ * Spawns agent execution in the configured container runtime and handles IPC
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
@@ -10,6 +10,7 @@ import path from 'path';
 import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
+  CONTAINER_RUNTIME,
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
@@ -57,6 +58,80 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+const ALLOWED_ENV_VARS = [
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_MODEL',
+  'NANOCLAW_MODEL',
+  'OLLAMA_HOST',
+  'OPENAI_API_KEY',
+  'OPENAI_BASE_URL',
+];
+
+function isPodmanRuntime(): boolean {
+  return CONTAINER_RUNTIME === 'podman';
+}
+
+function containerCli(): 'container' | 'podman' {
+  return isPodmanRuntime() ? 'podman' : 'container';
+}
+
+function parseEnvLine(line: string): [string, string] | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith('#')) return null;
+  const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+  if (!match) return null;
+  const key = match[1];
+  let value = match[2];
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1);
+  }
+  return [key, value];
+}
+
+function collectContainerSecrets(projectRoot: string): Record<string, string> {
+  const secrets: Record<string, string> = {};
+
+  // Launchd/runtime env takes precedence.
+  for (const key of ALLOWED_ENV_VARS) {
+    const value = process.env[key];
+    if (value && value.trim().length > 0) {
+      secrets[key] = value;
+    }
+  }
+
+  // Fill missing values from project .env if present.
+  const envFile = path.join(projectRoot, '.env');
+  if (fs.existsSync(envFile)) {
+    const envContent = fs.readFileSync(envFile, 'utf-8');
+    for (const line of envContent.split('\n')) {
+      const parsed = parseEnvLine(line);
+      if (!parsed) continue;
+      const [key, value] = parsed;
+      if (!ALLOWED_ENV_VARS.includes(key)) continue;
+      if (!secrets[key] && value.trim().length > 0) {
+        secrets[key] = value;
+      }
+    }
+  }
+
+  return secrets;
+}
+
+function redactSecrets(
+  secrets: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!secrets || Object.keys(secrets).length === 0) return undefined;
+  return Object.fromEntries(
+    Object.keys(secrets).map((k) => [k, '[REDACTED]']),
+  );
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
@@ -88,7 +163,6 @@ function buildVolumeMounts(
     });
 
     // Global memory directory (read-only for non-main)
-    // Apple Container only supports directory mounts, not file mounts
     const globalDir = path.join(GROUPS_DIR, 'global');
     if (fs.existsSync(globalDir)) {
       mounts.push({
@@ -159,8 +233,43 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Environment file directory (mounted as /workspace/env-dir for the entrypoint to source)
+  // Only expose specific auth variables needed by Claude Code, not the entire .env
+  const envDir = path.join(DATA_DIR, 'env');
+  fs.mkdirSync(envDir, { recursive: true });
+  const envFile = path.join(projectRoot, '.env');
+  if (fs.existsSync(envFile)) {
+    const envContent = fs.readFileSync(envFile, 'utf-8');
+    const filteredLines = envContent.split('\n').filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) return false;
+      return ALLOWED_ENV_VARS.some((v) => trimmed.startsWith(`${v}=`));
+    });
+
+    if (filteredLines.length > 0) {
+      fs.writeFileSync(
+        path.join(envDir, 'env'),
+        filteredLines.join('\n') + '\n',
+      );
+      mounts.push({
+        hostPath: envDir,
+        containerPath: '/workspace/env-dir',
+        readonly: true,
+      });
+    }
+  }
+
+  // Per-group persistent cache for model/tool downloads (docling, huggingface, pip, etc.).
+  // Keeps heavy artifacts out of mounted user data like /workspace/extra/home/_vault.
+  const cacheDir = path.join(DATA_DIR, 'cache', group.folder);
+  fs.mkdirSync(cacheDir, { recursive: true });
+  mounts.push({
+    hostPath: cacheDir,
+    containerPath: '/workspace/cache',
+    readonly: false,
+  });
+
   // Mount agent-runner source from host — recompiled on container startup.
-  // Bypasses Apple Container's sticky build cache for code changes.
   const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
   mounts.push({
     hostPath: agentRunnerSrc,
@@ -189,18 +298,30 @@ function readSecrets(): Record<string, string> {
   return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
 }
 
+
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
-  // Apple Container: --mount for readonly, -v for read-write
-  for (const mount of mounts) {
-    if (mount.readonly) {
+  if (isPodmanRuntime()) {
+    // Prefer local image for podman: don't pull from remote registries.
+    args.push('--pull=never');
+    for (const mount of mounts) {
       args.push(
-        '--mount',
-        `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
+        '-v',
+        `${mount.hostPath}:${mount.containerPath}${mount.readonly ? ':ro' : ''}`,
       );
-    } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+    }
+  } else {
+    // Apple Container: --mount for readonly, -v for read-write
+    for (const mount of mounts) {
+      if (mount.readonly) {
+        args.push(
+          '--mount',
+          `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
+        );
+      } else {
+        args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      }
     }
   }
 
@@ -219,6 +340,16 @@ export async function runContainerAgent(
 
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
+  const projectRoot = process.cwd();
+  const secrets = collectContainerSecrets(projectRoot);
+  const effectiveInput: ContainerInput = {
+    ...input,
+    ...(Object.keys(secrets).length > 0 ? { secrets } : {}),
+  };
+  const redactedInputForLog: ContainerInput = {
+    ...effectiveInput,
+    secrets: redactSecrets(effectiveInput.secrets),
+  };
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
@@ -242,6 +373,7 @@ export async function runContainerAgent(
     {
       group: group.name,
       containerName,
+      runtime: CONTAINER_RUNTIME,
       mountCount: mounts.length,
       isMain: input.isMain,
     },
@@ -252,7 +384,8 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('container', containerArgs, {
+    const runtimeCmd = containerCli();
+    const container = spawn(runtimeCmd, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -263,12 +396,9 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    // Pass secrets via stdin (never written to disk or mounted as files)
-    input.secrets = readSecrets();
-    container.stdin.write(JSON.stringify(input));
+    // Write input and close stdin so the runtime can flush/finish reading.
+    container.stdin.write(JSON.stringify(effectiveInput));
     container.stdin.end();
-    // Remove secrets from input so they don't appear in logs
-    delete input.secrets;
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
@@ -359,7 +489,7 @@ export async function runContainerAgent(
     const killOnTimeout = () => {
       timedOut = true;
       logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
-      exec(`container stop ${containerName}`, { timeout: 15000 }, (err) => {
+      exec(`${runtimeCmd} stop ${containerName}`, { timeout: 15000 }, (err) => {
         if (err) {
           logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
           container.kill('SIGKILL');
@@ -444,7 +574,7 @@ export async function runContainerAgent(
       if (isVerbose || isError) {
         logLines.push(
           `=== Input ===`,
-          JSON.stringify(input, null, 2),
+          JSON.stringify(redactedInputForLog, null, 2),
           ``,
           `=== Container Args ===`,
           containerArgs.join(' '),
@@ -466,8 +596,8 @@ export async function runContainerAgent(
       } else {
         logLines.push(
           `=== Input Summary ===`,
-          `Prompt length: ${input.prompt.length} chars`,
-          `Session ID: ${input.sessionId || 'new'}`,
+          `Prompt length: ${effectiveInput.prompt.length} chars`,
+          `Session ID: ${effectiveInput.sessionId || 'new'}`,
           ``,
           `=== Mounts ===`,
           mounts

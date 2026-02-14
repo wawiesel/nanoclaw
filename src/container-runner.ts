@@ -221,6 +221,17 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Share host Codex login state with container delegate_codex runs.
+  // This enables `codex` inside the container to reuse the host's auth.json.
+  const hostCodexDir = path.join(homeDir, '.codex');
+  if (fs.existsSync(hostCodexDir)) {
+    mounts.push({
+      hostPath: hostCodexDir,
+      containerPath: '/home/node/.codex',
+      readonly: true,
+    });
+  }
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);

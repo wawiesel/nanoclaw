@@ -5,12 +5,20 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  GROUPS_DIR,
+  HEAP_LIMIT_MB,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
+  MATRIX_ACCESS_TOKEN,
+  MATRIX_HOMESERVER,
+  MATRIX_PASSWORD,
+  MATRIX_RECONNECT_INTERVAL,
+  MATRIX_USERNAME,
+  MEMORY_CHECK_INTERVAL,
   POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
-import { WhatsAppChannel } from './channels/whatsapp.js';
+import { MatrixChannel } from './channels/matrix.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -34,9 +42,9 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
-import { formatMessages, formatOutbound } from './router.js';
+import { findChannel, formatMessages, stripInternalTags } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { NewMessage, RegisteredGroup } from './types.js';
+import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -48,7 +56,7 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
-let whatsapp: WhatsAppChannel;
+let channels: Channel[] = [];
 const queue = new GroupQueue();
 
 function loadState(): void {
@@ -99,7 +107,7 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
   const registeredJids = new Set(Object.keys(registeredGroups));
 
   return chats
-    .filter((c) => c.jid !== '__group_sync__' && c.jid.endsWith('@g.us'))
+    .filter((c) => c.jid !== '__group_sync__' && c.jid.startsWith('matrix:'))
     .map((c) => ({
       jid: c.jid,
       name: c.name,
@@ -111,6 +119,53 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
 /** @internal - exported for testing */
 export function _setRegisteredGroups(groups: Record<string, RegisteredGroup>): void {
   registeredGroups = groups;
+}
+
+/**
+ * Append a brief entry to the group's conversation log.
+ * Used for cross-channel context between WhatsApp and terminal sessions.
+ */
+function appendConversationLog(
+  groupFolder: string,
+  userMessages: NewMessage[],
+  agentResponses: string[],
+  channelName = 'matrix',
+): void {
+  if (userMessages.length === 0 && agentResponses.length === 0) return;
+
+  const logDir = path.join(GROUPS_DIR, groupFolder, 'conversations');
+  const logPath = path.join(logDir, 'log.md');
+  fs.mkdirSync(logDir, { recursive: true });
+
+  const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 16);
+  const lines = ['---', `${timestamp} [${channelName}]`];
+
+  for (const msg of userMessages) {
+    const content = msg.content.length > 200
+      ? msg.content.slice(0, 200) + '...'
+      : msg.content;
+    lines.push(`${msg.sender_name}: ${content}`);
+  }
+
+  for (const response of agentResponses) {
+    const content = response.length > 200
+      ? response.slice(0, 200) + '...'
+      : response;
+    lines.push(`${ASSISTANT_NAME}: ${content}`);
+  }
+
+  fs.appendFileSync(logPath, lines.join('\n') + '\n');
+
+  // Trim to last 100 entries
+  try {
+    const full = fs.readFileSync(logPath, 'utf-8');
+    const entries = full.split(/(?=^---$)/m).filter((e) => e.trim());
+    if (entries.length > 100) {
+      fs.writeFileSync(logPath, entries.slice(-100).join(''));
+    }
+  } catch {
+    // Non-critical — log continues to grow until next successful trim
+  }
 }
 
 /**
@@ -161,11 +216,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await whatsapp.setTyping(chatJid, true);
+  const channel = findChannel(channels, chatJid);
+  if (channel?.setTyping) await channel.setTyping(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  const agentResponses: string[] = [];
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
+  const runResult = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
       const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
@@ -173,8 +230,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await whatsapp.sendMessage(chatJid, text);
+        const ch = findChannel(channels, chatJid);
+        if (ch) {
+          const prefixed = `main: ${text}`;
+          await ch.sendMessage(chatJid, prefixed);
+        }
         outputSentToUser = true;
+        agentResponses.push(`main: ${text}`);
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -185,14 +247,35 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await whatsapp.setTyping(chatJid, false);
+  if (channel?.setTyping) await channel.setTyping(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
-  if (output === 'error' || hadError) {
+  if (runResult.status === 'error' || hadError) {
+    const rawError =
+      runResult.error ||
+      (hadError ? 'agent returned an error status' : 'unknown error');
+    const compactError = rawError.replace(/\s+/g, ' ').slice(0, 220);
+
+    if (!outputSentToUser && channel) {
+      const errorReply =
+        `main: I hit an error while processing that request: ${compactError}`;
+      try {
+        await channel.sendMessage(chatJid, errorReply);
+        outputSentToUser = true;
+        agentResponses.push(errorReply);
+      } catch (sendErr) {
+        logger.warn(
+          { group: group.name, err: sendErr },
+          'Failed to send error reply to channel',
+        );
+      }
+    }
+
     // If we already sent output to the user, don't roll back the cursor —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
       logger.warn({ group: group.name }, 'Agent error after output was sent, skipping cursor rollback to prevent duplicates');
+      appendConversationLog(group.folder, missedMessages, agentResponses, channel?.name);
       return true;
     }
     // Roll back cursor so retries can re-process these messages
@@ -202,6 +285,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return false;
   }
 
+  appendConversationLog(group.folder, missedMessages, agentResponses, channel?.name);
   return true;
 }
 
@@ -210,9 +294,10 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
-): Promise<'success' | 'error'> {
+): Promise<{ status: 'success' | 'error'; error?: string }> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
-  const sessionId = sessions[group.folder];
+  const sessionKey = group.folder;
+  const sessionId = sessions[sessionKey];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -243,8 +328,8 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          sessions[sessionKey] = output.newSessionId;
+          setSession(sessionKey, output.newSessionId);
         }
         await onOutput(output);
       }
@@ -265,8 +350,8 @@ async function runAgent(
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions[sessionKey] = output.newSessionId;
+      setSession(sessionKey, output.newSessionId);
     }
 
     if (output.status === 'error') {
@@ -274,13 +359,19 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
-      return 'error';
+      return {
+        status: 'error',
+        error: output.error || 'container agent error',
+      };
     }
 
-    return 'success';
+    return { status: 'success' };
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
-    return 'error';
+    return {
+      status: 'error',
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 
@@ -406,21 +497,21 @@ function ensureContainerSystemRunning(): void {
         '║                                                                ║',
       );
       console.error(
-        '║  Agents cannot run without Apple Container. To fix:           ║',
+        '║  Agents cannot run without Apple Container system.             ║',
       );
       console.error(
-        '║  1. Install from: https://github.com/apple/container/releases ║',
+        '║  Install from: https://github.com/apple/container              ║',
       );
       console.error(
-        '║  2. Run: container system start                               ║',
+        '║  Then run: container system start                              ║',
       );
       console.error(
-        '║  3. Restart NanoClaw                                          ║',
+        '║  Then restart NanoClaw                                         ║',
       );
       console.error(
         '╚════════════════════════════════════════════════════════════════╝\n',
       );
-      throw new Error('Apple Container system is required but failed to start');
+      throw new Error('Apple Container system is required but not running');
     }
   }
 
@@ -457,21 +548,74 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     await queue.shutdown(10000);
-    await whatsapp.disconnect();
+    for (const ch of channels) await ch.disconnect();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  // Create WhatsApp channel
-  whatsapp = new WhatsAppChannel({
-    onMessage: (chatJid, msg) => storeMessage(msg),
-    onChatMetadata: (chatJid, timestamp) => storeChatMetadata(chatJid, timestamp),
-    registeredGroups: () => registeredGroups,
-  });
+  // Create Matrix channel (activates only if configured)
+  let matrix: MatrixChannel | null = null;
+  if (
+    MATRIX_HOMESERVER &&
+    (MATRIX_ACCESS_TOKEN || (MATRIX_USERNAME && MATRIX_PASSWORD))
+  ) {
+    matrix = new MatrixChannel({
+      onMessage: (_chatJid, msg) => storeMessage(msg),
+      onChatMetadata: (chatJid, timestamp, name) => storeChatMetadata(chatJid, timestamp, name),
+      registeredGroups: () => registeredGroups,
+    });
+  }
 
-  // Connect — resolves when first connected
-  await whatsapp.connect();
+  // Build channels array (only include connected channels)
+  const allChannels: (Channel | null)[] = [matrix];
+  const refreshConnectedChannels = () => {
+    channels = allChannels.filter((ch): ch is Channel => ch != null && ch.isConnected());
+  };
+  refreshConnectedChannels();
+
+  // Connect channels
+  if (matrix) {
+    try {
+      await matrix.connect();
+    } catch (err) {
+      logger.error({ err }, 'Initial Matrix connection failed; continuing in degraded mode');
+    }
+    refreshConnectedChannels();
+
+    let matrixReconnectInProgress = false;
+    setInterval(async () => {
+      if (!matrix || matrixReconnectInProgress) return;
+      matrixReconnectInProgress = true;
+      try {
+        const healthy = await matrix.checkHealth();
+        if (!healthy) {
+          await matrix.connect();
+          if (matrix.isConnected()) {
+            logger.info('Matrix reconnected');
+          }
+        }
+      } catch (err) {
+        logger.warn({ err }, 'Matrix reconnect attempt failed');
+      } finally {
+        refreshConnectedChannels();
+        matrixReconnectInProgress = false;
+      }
+    }, MATRIX_RECONNECT_INTERVAL);
+  }
+
+  // Memory watchdog — gracefully recycle before OOM
+  const heapLimitBytes = HEAP_LIMIT_MB * 1024 * 1024;
+  setInterval(() => {
+    const usage = process.memoryUsage();
+    const heapMB = Math.round(usage.heapUsed / 1024 / 1024);
+    const rssMB = Math.round(usage.rss / 1024 / 1024);
+    logger.info({ heapMB, rssMB, limitMB: HEAP_LIMIT_MB }, 'Memory');
+    if (usage.heapUsed > heapLimitBytes) {
+      logger.warn({ heapMB, limitMB: HEAP_LIMIT_MB }, 'Heap limit exceeded, recycling');
+      shutdown('HEAP_LIMIT');
+    }
+  }, MEMORY_CHECK_INTERVAL);
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -480,15 +624,28 @@ async function main(): Promise<void> {
     queue,
     onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
-      const text = formatOutbound(rawText);
-      if (text) await whatsapp.sendMessage(jid, text);
+      const ch = findChannel(channels, jid);
+      if (!ch) return;
+      const text = stripInternalTags(rawText);
+      if (text) await ch.sendMessage(jid, `main: ${text}`);
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => whatsapp.sendMessage(jid, text),
+    sendMessage: (jid, text) => {
+      const ch = findChannel(channels, jid);
+      if (ch) return ch.sendMessage(jid, text);
+      logger.warn({ jid }, 'No channel found for IPC message');
+      return Promise.resolve();
+    },
+    sendImage: (jid, buffer, filename, mimetype, caption) => {
+      const ch = findChannel(channels, jid);
+      if (ch?.sendImage) return ch.sendImage(jid, buffer, filename, mimetype, caption);
+      logger.warn({ jid }, 'No channel with image support found for IPC image');
+      return Promise.resolve();
+    },
     registeredGroups: () => registeredGroups,
     registerGroup,
-    syncGroupMetadata: (force) => whatsapp.syncGroupMetadata(force),
+    syncGroupMetadata: async () => {},
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
   });

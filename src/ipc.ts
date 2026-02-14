@@ -16,6 +16,7 @@ import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendImage: (jid: string, buffer: Buffer, filename: string, mimetype: string, caption?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -71,14 +72,20 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              // Authorization: verify this group can send to this chatJid
+              const targetGroup = registeredGroups[data.chatJid];
+              const authorized = isMain || (targetGroup && targetGroup.folder === sourceGroup);
+
               if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                if (authorized) {
+                  const sender =
+                    typeof data.sender === 'string' && data.sender.trim()
+                      ? data.sender.trim()
+                      : 'main';
+                  await deps.sendMessage(
+                    data.chatJid,
+                    `${sender}: ${data.text}`,
+                  );
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',
@@ -87,6 +94,26 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (data.type === 'image' && data.chatJid && data.imageData) {
+                if (authorized) {
+                  const buffer = Buffer.from(data.imageData, 'base64');
+                  await deps.sendImage(
+                    data.chatJid,
+                    buffer,
+                    data.filename || 'image.png',
+                    data.mimetype || 'image/png',
+                    data.caption,
+                  );
+                  logger.info(
+                    { chatJid: data.chatJid, sourceGroup, filename: data.filename },
+                    'IPC image sent',
+                  );
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC image attempt blocked',
                   );
                 }
               }

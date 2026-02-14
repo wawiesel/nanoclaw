@@ -95,6 +95,15 @@ function sanitizeHref(url: string): string | null {
   return null;
 }
 
+function normalizeSenderPrefixForMarkdown(text: string): string {
+  const match = text.match(/^([^\n:]{1,160}):\s+([\s\S]+)$/);
+  if (!match) return text;
+  const sender = match[1].trim();
+  const body = match[2];
+  if (!sender || !body) return text;
+  return `${sender}: \n\n${body}`;
+}
+
 export function toFormattedBodyWithMarkdownAndMath(text: string): {
   formattedBody: string;
   hasRichFormatting: boolean;
@@ -615,17 +624,19 @@ export class MatrixChannel implements Channel {
   async sendMessage(jid: string, text: string): Promise<void> {
     if (!this.client || !this._connected) return;
     const roomId = toRoomId(jid);
-    const { formattedBody, hasRichFormatting } = toFormattedBodyWithMarkdownAndMath(text);
+    const normalizedText = normalizeSenderPrefixForMarkdown(text);
+    const { formattedBody, hasRichFormatting } =
+      toFormattedBodyWithMarkdownAndMath(normalizedText);
     try {
       if (hasRichFormatting) {
         await this.client.sendMessage(roomId, {
           msgtype: 'm.text',
-          body: text,
+          body: normalizedText,
           format: 'org.matrix.custom.html',
           formatted_body: formattedBody,
         });
       } else {
-        await this.client.sendText(roomId, text);
+        await this.client.sendText(roomId, normalizedText);
       }
     } catch (err) {
       if (this.isAuthFailure(err)) {

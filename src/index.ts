@@ -56,6 +56,51 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+function resolveMainProvider(): 'claude' | 'ollama' {
+  const anthropicBaseUrl = (process.env.ANTHROPIC_BASE_URL || '').toLowerCase();
+  if (anthropicBaseUrl.includes('ollama')) {
+    return 'ollama';
+  }
+  return 'claude';
+}
+function resolveMainLlm(): string {
+  const firstSet = (
+    ...values: Array<string | undefined>
+  ): string | undefined => {
+    for (const v of values) {
+      const s = v?.trim();
+      if (s) return s;
+    }
+    return undefined;
+  };
+
+  // Explicit app-level override first.
+  const directModel = firstSet(
+    process.env.NANOCLAW_MODEL,
+    process.env.ANTHROPIC_MODEL,
+  );
+  if (directModel) return directModel;
+
+  // If Anthropic endpoint is redirected to Ollama, prefer Ollama model env.
+  const anthropicBaseUrl = (process.env.ANTHROPIC_BASE_URL || '').toLowerCase();
+  if (anthropicBaseUrl.includes('ollama')) {
+    const ollamaModel = firstSet(process.env.OLLAMA_MODEL, process.env.MODEL);
+    if (ollamaModel) return ollamaModel;
+  }
+
+  // Generic fallback for other redirected providers.
+  return firstSet(
+    process.env.OLLAMA_MODEL,
+    process.env.OPENAI_MODEL,
+    process.env.MODEL,
+    process.env.GEMINI_MODEL,
+    process.env.CODEX_MODEL,
+    'unknown-model',
+  )!;
+}
+const MAIN_LLM = resolveMainLlm();
+const MAIN_PROVIDER = resolveMainProvider();
+const MAIN_SENDER = `MAIN(${MAIN_PROVIDER},${MAIN_LLM})`;
 
 let channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -233,11 +278,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (text) {
         const ch = findChannel(channels, chatJid);
         if (ch) {
-          const prefixed = `main: ${text}`;
+          const prefixed = `${MAIN_SENDER}: ${text}`;
           await ch.sendMessage(chatJid, prefixed);
         }
         outputSentToUser = true;
-        agentResponses.push(`main: ${text}`);
+        agentResponses.push(`${MAIN_SENDER}: ${text}`);
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -259,7 +304,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     if (!outputSentToUser && channel) {
       const errorReply =
-        `main: I hit an error while processing that request: ${compactError}`;
+        `${MAIN_SENDER}: I hit an error while processing that request: ${compactError}`;
       try {
         await channel.sendMessage(chatJid, errorReply);
         outputSentToUser = true;
@@ -685,7 +730,7 @@ async function main(): Promise<void> {
       const ch = findChannel(channels, jid);
       if (!ch) return;
       const text = stripInternalTags(rawText);
-      if (text) await ch.sendMessage(jid, `main: ${text}`);
+      if (text) await ch.sendMessage(jid, `${MAIN_SENDER}: ${text}`);
     },
   });
   startIpcWatcher({

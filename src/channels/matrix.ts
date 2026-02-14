@@ -87,32 +87,53 @@ function findClosingDoubleDollar(text: string, from: number): number {
   return -1;
 }
 
-function toFormattedBodyWithMath(text: string): {
+function sanitizeHref(url: string): string | null {
+  const trimmed = url.trim();
+  if (/^(https?:\/\/|mailto:|file:\/\/)/i.test(trimmed)) {
+    return escapeHtml(trimmed);
+  }
+  return null;
+}
+
+export function toFormattedBodyWithMarkdownAndMath(text: string): {
   formattedBody: string;
-  hasMath: boolean;
+  hasRichFormatting: boolean;
 } {
+  const tokens: string[] = [];
+  const placeholder = (html: string): string => {
+    const idx = tokens.push(html) - 1;
+    return `@@MATRIX_TOKEN_${idx}@@`;
+  };
+
+  let working = text;
+  let hasRichFormatting = false;
+
+  working = working.replace(/```([^\n`]*)\n([\s\S]*?)```/g, (_m, _lang, code) => {
+    hasRichFormatting = true;
+    return placeholder(`<pre><code>${escapeHtml(code)}</code></pre>`);
+  });
+
+  working = working.replace(/```\n?([\s\S]*?)```/g, (_m, code) => {
+    hasRichFormatting = true;
+    return placeholder(`<pre><code>${escapeHtml(code)}</code></pre>`);
+  });
+
   let out = '';
   let i = 0;
-  let hasMath = false;
 
-  while (i < text.length) {
-    if (text[i] === '\n') {
-      out += '<br/>';
-      i++;
-      continue;
-    }
-
+  while (i < working.length) {
     if (
-      text[i] === '$' &&
-      text[i + 1] === '$' &&
-      !isEscaped(text, i)
+      working[i] === '$' &&
+      working[i + 1] === '$' &&
+      !isEscaped(working, i)
     ) {
-      const end = findClosingDoubleDollar(text, i + 2);
+      const end = findClosingDoubleDollar(working, i + 2);
       if (end !== -1 && end > i + 2) {
-        const latex = text.slice(i + 2, end).trim();
+        const latex = working.slice(i + 2, end).trim();
         if (latex.length > 0) {
-          out += `<div data-mx-maths="${escapeHtml(latex)}"><code>${escapeHtml(latex)}</code></div>`;
-          hasMath = true;
+          const html = `<div data-mx-maths="${escapeHtml(latex)}"><code>${escapeHtml(latex)}</code></div>`;
+          out += placeholder(html);
+          hasRichFormatting = true;
           i = end + 2;
           continue;
         }
@@ -120,27 +141,61 @@ function toFormattedBodyWithMath(text: string): {
     }
 
     if (
-      text[i] === '$' &&
-      text[i + 1] !== '$' &&
-      !isEscaped(text, i)
+      working[i] === '$' &&
+      working[i + 1] !== '$' &&
+      !isEscaped(working, i)
     ) {
-      const end = findClosingSingleDollar(text, i + 1);
+      const end = findClosingSingleDollar(working, i + 1);
       if (end !== -1 && end > i + 1) {
-        const latex = text.slice(i + 1, end).trim();
+        const latex = working.slice(i + 1, end).trim();
         if (latex.length > 0) {
-          out += `<span data-mx-maths="${escapeHtml(latex)}"><code>${escapeHtml(latex)}</code></span>`;
-          hasMath = true;
+          const html = `<span data-mx-maths="${escapeHtml(latex)}"><code>${escapeHtml(latex)}</code></span>`;
+          out += placeholder(html);
+          hasRichFormatting = true;
           i = end + 1;
           continue;
         }
       }
     }
 
-    out += escapeHtml(text[i]);
+    out += working[i];
     i++;
   }
 
-  return { formattedBody: out, hasMath };
+  working = out;
+  working = working.replace(/`([^`\n]+)`/g, (_m, code) => {
+    hasRichFormatting = true;
+    return placeholder(`<code>${escapeHtml(code)}</code>`);
+  });
+
+  working = escapeHtml(working);
+
+  working = working.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, (_m, label, href) => {
+    const safeHref = sanitizeHref(href);
+    if (!safeHref) return _m;
+    hasRichFormatting = true;
+    return `<a href="${safeHref}">${label}</a>`;
+  });
+  working = working.replace(/\*\*([^*\n]+)\*\*/g, (_m, textPart) => {
+    hasRichFormatting = true;
+    return `<strong>${textPart}</strong>`;
+  });
+  working = working.replace(/~~([^~\n]+)~~/g, (_m, textPart) => {
+    hasRichFormatting = true;
+    return `<del>${textPart}</del>`;
+  });
+  working = working.replace(/\*([^*\n]+)\*/g, (_m, textPart) => {
+    hasRichFormatting = true;
+    return `<em>${textPart}</em>`;
+  });
+  working = working.replace(/\n/g, '<br/>');
+
+  const formattedBody = working.replace(
+    /@@MATRIX_TOKEN_(\d+)@@/g,
+    (_m, idxText) => tokens[Number(idxText)] ?? '',
+  );
+
+  return { formattedBody, hasRichFormatting };
 }
 
 function defaultExtensionForMime(mimetype: string): string {
@@ -471,6 +526,15 @@ export class MatrixChannel implements Channel {
       return await validate(passwordClient, 'password_login');
     }
 
+    logger.error(
+      {
+        hasEnvAccessToken: !!MATRIX_ACCESS_TOKEN,
+        hasStoredAccessToken: !!storedAccessToken,
+        hasStoredRefreshToken: !!storedRefreshToken,
+        hasPasswordLogin,
+      },
+      'Matrix auth failed: no valid token/login available',
+    );
     return null;
   }
 
@@ -551,9 +615,9 @@ export class MatrixChannel implements Channel {
   async sendMessage(jid: string, text: string): Promise<void> {
     if (!this.client || !this._connected) return;
     const roomId = toRoomId(jid);
-    const { formattedBody, hasMath } = toFormattedBodyWithMath(text);
+    const { formattedBody, hasRichFormatting } = toFormattedBodyWithMarkdownAndMath(text);
     try {
-      if (hasMath) {
+      if (hasRichFormatting) {
         await this.client.sendMessage(roomId, {
           msgtype: 'm.text',
           body: text,

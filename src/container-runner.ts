@@ -67,7 +67,6 @@ const ALLOWED_ENV_VARS = [
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_MODEL',
-  'NANOCLAW_MAIN_MODEL',
   'OLLAMA_HOST',
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
@@ -144,6 +143,49 @@ function collectContainerSecrets(projectRoot: string): Record<string, string> {
   return secrets;
 }
 
+function isOllamaAnthropicBaseUrl(baseUrl: string | undefined): boolean {
+  const trimmed = baseUrl?.trim();
+  if (!trimmed) return false;
+
+  const normalized = trimmed.toLowerCase();
+  if (normalized.includes('ollama')) return true;
+
+  try {
+    const parsed = new URL(trimmed);
+    const port =
+      parsed.port ||
+      (parsed.protocol === 'https:' ? '443' : parsed.protocol === 'http:' ? '80' : '');
+    return port === '11434';
+  } catch {
+    return false;
+  }
+}
+
+function normalizeProviderSecrets(
+  secrets: Record<string, string>,
+): Record<string, string> {
+  const normalized = { ...secrets };
+  if (!isOllamaAnthropicBaseUrl(normalized.ANTHROPIC_BASE_URL)) {
+    return normalized;
+  }
+
+  // In Ollama mode, force Claude SDK to use Anthropic-compatible endpoint auth.
+  // Passing account OAuth here can cause SDK to ignore base URL routing.
+  delete normalized.CLAUDE_CODE_OAUTH_TOKEN;
+  delete normalized.ANTHROPIC_API_KEY;
+
+  const explicitModel = normalized.ANTHROPIC_MODEL?.trim();
+  if (explicitModel) {
+    normalized.ANTHROPIC_MODEL = explicitModel;
+  }
+
+  if (!normalized.ANTHROPIC_AUTH_TOKEN?.trim()) {
+    normalized.ANTHROPIC_AUTH_TOKEN = 'ollama';
+  }
+
+  return normalized;
+}
+
 function redactSecrets(
   secrets: Record<string, string> | undefined,
 ): Record<string, string> | undefined {
@@ -202,9 +244,14 @@ function mapCertPathSecretsToContainer(
   return mapped;
 }
 
+function quoteEnvValue(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  normalizedSecrets: Record<string, string>,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const homeDir = getHomeDir();
@@ -328,26 +375,17 @@ function buildVolumeMounts(
   // Only expose specific auth variables needed by Claude Code, not the entire .env
   const envDir = path.join(DATA_DIR, 'env');
   fs.mkdirSync(envDir, { recursive: true });
-  const envFile = path.join(projectRoot, '.env');
-  if (fs.existsSync(envFile)) {
-    const envContent = fs.readFileSync(envFile, 'utf-8');
-    const filteredLines = envContent.split('\n').filter((line) => {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) return false;
-      return ALLOWED_ENV_VARS.some((v) => trimmed.startsWith(`${v}=`));
-    });
+  const filteredLines = Object.entries(normalizedSecrets)
+    .filter(([key, value]) => ALLOWED_ENV_VARS.includes(key) && value.trim().length > 0)
+    .map(([key, value]) => `${key}=${quoteEnvValue(value)}`);
 
-    if (filteredLines.length > 0) {
-      fs.writeFileSync(
-        path.join(envDir, 'env'),
-        filteredLines.join('\n') + '\n',
-      );
-      mounts.push({
-        hostPath: envDir,
-        containerPath: '/workspace/env-dir',
-        readonly: true,
-      });
-    }
+  if (filteredLines.length > 0) {
+    fs.writeFileSync(path.join(envDir, 'env'), filteredLines.join('\n') + '\n');
+    mounts.push({
+      hostPath: envDir,
+      containerPath: '/workspace/env-dir',
+      readonly: true,
+    });
   }
 
   // Per-group persistent cache for model/tool downloads (docling, huggingface, pip, etc.).
@@ -438,8 +476,8 @@ export async function runContainerAgent(
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
   const projectRoot = process.cwd();
-  const mounts = buildVolumeMounts(group, input.isMain);
-  const secrets = collectContainerSecrets(projectRoot);
+  const secrets = normalizeProviderSecrets(collectContainerSecrets(projectRoot));
+  const mounts = buildVolumeMounts(group, input.isMain, secrets);
   const mappedSecrets = mapCertPathSecretsToContainer(secrets, mounts);
   const effectiveInput: ContainerInput = {
     ...input,

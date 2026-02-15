@@ -40,6 +40,30 @@ const STORAGE_ACCESS_TOKEN = 'matrix_access_token';
 const STORAGE_REFRESH_TOKEN = 'matrix_refresh_token';
 const STORAGE_DEVICE_ID = 'matrix_device_id';
 const STORAGE_USER_ID = 'matrix_user_id';
+const MATRIX_SEND_TIMEOUT_MS = 4_000;
+const MATRIX_TYPING_TIMEOUT_MS = 1_500;
+const MATRIX_META_TIMEOUT_MS = 2_500;
+const MATRIX_HEALTH_TIMEOUT_MS = 5_000;
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  op: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`Matrix ${op} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function toJid(roomId: string): string {
   return `matrix:${roomId}`;
@@ -433,7 +457,11 @@ export class MatrixChannel implements Channel {
         | 'refresh_token'
         | 'password_login',
     ): Promise<MatrixClient> => {
-      const whoami = await client.getWhoAmI();
+      const whoami = await withTimeout(
+        client.getWhoAmI(),
+        MATRIX_HEALTH_TIMEOUT_MS,
+        'getWhoAmI',
+      );
       this.botUserId = whoami.user_id || MATRIX_USER_ID;
       storage.storeValue(STORAGE_USER_ID, this.botUserId);
       logger.info(
@@ -612,7 +640,7 @@ export class MatrixChannel implements Channel {
     });
 
     try {
-      await client.start();
+      await withTimeout(client.start(), MATRIX_HEALTH_TIMEOUT_MS, 'client.start');
       this._connected = true;
       logger.info('Connected to Matrix');
     } catch (err) {
@@ -629,14 +657,22 @@ export class MatrixChannel implements Channel {
       toFormattedBodyWithMarkdownAndMath(normalizedText);
     try {
       if (hasRichFormatting) {
-        await this.client.sendMessage(roomId, {
-          msgtype: 'm.text',
-          body: normalizedText,
-          format: 'org.matrix.custom.html',
-          formatted_body: formattedBody,
-        });
+        await withTimeout(
+          this.client.sendMessage(roomId, {
+            msgtype: 'm.text',
+            body: normalizedText,
+            format: 'org.matrix.custom.html',
+            formatted_body: formattedBody,
+          }),
+          MATRIX_SEND_TIMEOUT_MS,
+          'sendMessage',
+        );
       } else {
-        await this.client.sendText(roomId, normalizedText);
+        await withTimeout(
+          this.client.sendText(roomId, normalizedText),
+          MATRIX_SEND_TIMEOUT_MS,
+          'sendText',
+        );
       }
     } catch (err) {
       if (this.isAuthFailure(err)) {
@@ -667,7 +703,11 @@ export class MatrixChannel implements Channel {
   async checkHealth(): Promise<boolean> {
     if (!this.client || !this._connected) return false;
     try {
-      await this.client.getWhoAmI();
+      await withTimeout(
+        this.client.getWhoAmI(),
+        MATRIX_HEALTH_TIMEOUT_MS,
+        'health check getWhoAmI',
+      );
       return true;
     } catch (err) {
       this.markDisconnected('Matrix health check failed', err);
@@ -680,7 +720,11 @@ export class MatrixChannel implements Channel {
     const roomId = toRoomId(jid);
     try {
       logger.info({ filename, mimetype, size: buffer.length }, 'Uploading image to Matrix');
-      const mxcUrl = await this.client.uploadContent(buffer, mimetype, filename);
+      const mxcUrl = await withTimeout(
+        this.client.uploadContent(buffer, mimetype, filename),
+        MATRIX_SEND_TIMEOUT_MS,
+        'uploadContent(image)',
+      );
       logger.info({ mxcUrl, filename }, 'Image uploaded, sending to room');
       const effectiveFilename = filename?.trim()
         ? filename.trim()
@@ -713,7 +757,11 @@ export class MatrixChannel implements Channel {
         url: mxcUrl,
         info,
       };
-      await this.client.sendMessage(roomId, content);
+      await withTimeout(
+        this.client.sendMessage(roomId, content),
+        MATRIX_SEND_TIMEOUT_MS,
+        'sendMessage(image)',
+      );
       if (caption && caption.trim()) {
         await this.sendMessage(jid, caption.trim());
       }
@@ -731,7 +779,11 @@ export class MatrixChannel implements Channel {
     const roomId = toRoomId(jid);
     try {
       logger.info({ filename, mimetype, size: buffer.length }, 'Uploading file to Matrix');
-      const mxcUrl = await this.client.uploadContent(buffer, mimetype, filename);
+      const mxcUrl = await withTimeout(
+        this.client.uploadContent(buffer, mimetype, filename),
+        MATRIX_SEND_TIMEOUT_MS,
+        'uploadContent(file)',
+      );
       logger.info({ mxcUrl, filename }, 'File uploaded, sending to room');
       const effectiveFilename = filename?.trim()
         ? filename.trim()
@@ -746,7 +798,11 @@ export class MatrixChannel implements Channel {
           size: buffer.length,
         },
       };
-      await this.client.sendMessage(roomId, content);
+      await withTimeout(
+        this.client.sendMessage(roomId, content),
+        MATRIX_SEND_TIMEOUT_MS,
+        'sendMessage(file)',
+      );
       if (caption && caption.trim()) {
         await this.sendMessage(jid, caption.trim());
       }
@@ -763,7 +819,11 @@ export class MatrixChannel implements Channel {
     if (!this.client || !this._connected) return;
     const roomId = toRoomId(jid);
     try {
-      await this.client.setTyping(roomId, isTyping, 30000);
+      await withTimeout(
+        this.client.setTyping(roomId, isTyping, 30000),
+        MATRIX_TYPING_TIMEOUT_MS,
+        'setTyping',
+      );
     } catch {
       // Non-critical
     }
@@ -772,7 +832,11 @@ export class MatrixChannel implements Channel {
   private async getSenderName(userId: string): Promise<string> {
     if (!this.client) return userId;
     try {
-      const profile = await this.client.getUserProfile(userId);
+      const profile = await withTimeout(
+        this.client.getUserProfile(userId),
+        MATRIX_META_TIMEOUT_MS,
+        'getUserProfile',
+      );
       return profile.displayname || userId.split(':')[0].slice(1);
     } catch {
       return userId.split(':')[0].slice(1);
@@ -782,7 +846,11 @@ export class MatrixChannel implements Channel {
   private async getRoomName(roomId: string): Promise<string> {
     if (!this.client) return roomId;
     try {
-      const state = await this.client.getRoomStateEvent(roomId, 'm.room.name', '');
+      const state = await withTimeout(
+        this.client.getRoomStateEvent(roomId, 'm.room.name', ''),
+        MATRIX_META_TIMEOUT_MS,
+        'getRoomStateEvent(m.room.name)',
+      );
       return state.name || roomId;
     } catch {
       return roomId;

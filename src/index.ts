@@ -1,9 +1,10 @@
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  CONTAINER_IMAGE,
   CONTAINER_RUNTIME,
   DATA_DIR,
   GROUPS_DIR,
@@ -806,59 +807,206 @@ function recoverPendingMessages(): void {
   }
 }
 
-function ensureContainerSystemRunning(): void {
+type PodmanMachineListEntry = {
+  Name: string;
+  Default?: boolean;
+  Running?: boolean;
+  Starting?: boolean;
+};
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function canReachPodmanApi(): boolean {
+  try {
+    execSync('podman info', { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function podmanCommandSucceeded(args: string[]): boolean {
+  const result = spawnSync('podman', args, { stdio: 'ignore' });
+  return result.status === 0;
+}
+
+function ensurePodmanImageAvailable(): void {
+  if (podmanCommandSucceeded(['image', 'exists', CONTAINER_IMAGE])) {
+    logger.debug({ image: CONTAINER_IMAGE }, 'Podman image available');
+    return;
+  }
+
+  const dockerfilePath = path.join(process.cwd(), 'container', 'Dockerfile');
+  const buildContext = path.join(process.cwd(), 'container');
+  if (!fs.existsSync(dockerfilePath) || !fs.existsSync(buildContext)) {
+    throw new Error(
+      `Container image ${CONTAINER_IMAGE} missing and build context not found`,
+    );
+  }
+
+  logger.warn({ image: CONTAINER_IMAGE }, 'Podman image missing; rebuilding');
+  const buildResult = spawnSync(
+    'podman',
+    ['build', '-t', CONTAINER_IMAGE, '-f', dockerfilePath, buildContext],
+    {
+      stdio: 'inherit',
+      timeout: 30 * 60 * 1000,
+    },
+  );
+
+  if (buildResult.error) {
+    throw new Error(
+      `Failed to rebuild container image ${CONTAINER_IMAGE}: ${buildResult.error.message}`,
+    );
+  }
+
+  if (buildResult.status !== 0) {
+    throw new Error(
+      `Failed to rebuild container image ${CONTAINER_IMAGE} (exit code ${buildResult.status ?? 'unknown'})`,
+    );
+  }
+
+  if (!podmanCommandSucceeded(['image', 'exists', CONTAINER_IMAGE])) {
+    throw new Error(
+      `Container image ${CONTAINER_IMAGE} is still missing after rebuild`,
+    );
+  }
+
+  logger.info({ image: CONTAINER_IMAGE }, 'Podman image rebuilt and ready');
+}
+
+async function waitForPodmanApi(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (canReachPodmanApi()) return true;
+    await sleep(1000);
+  }
+  return canReachPodmanApi();
+}
+
+function getPodmanMachines(): PodmanMachineListEntry[] {
+  const output = execSync('podman machine list --format json', {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    encoding: 'utf-8',
+  });
+  const parsed: unknown = JSON.parse(output || '[]');
+  if (!Array.isArray(parsed)) return [];
+  return parsed.filter(
+    (item): item is PodmanMachineListEntry =>
+      !!item &&
+      typeof item === 'object' &&
+      'Name' in item &&
+      typeof (item as { Name: unknown }).Name === 'string',
+  );
+}
+
+function selectPodmanMachine(machines: PodmanMachineListEntry[]): PodmanMachineListEntry | undefined {
+  return machines.find((m) => m.Default) || machines[0];
+}
+
+async function ensurePodmanRuntimeAvailable(): Promise<void> {
+  if (await waitForPodmanApi(2000)) {
+    logger.debug('Podman runtime available');
+    return;
+  }
+
+  logger.warn('Podman runtime unavailable; attempting machine recovery');
+
+  let machineName = 'podman-machine-default';
+  try {
+    const machine = selectPodmanMachine(getPodmanMachines());
+    if (!machine) {
+      throw new Error('No podman machine exists. Run: podman machine init');
+    }
+    machineName = machine.Name;
+    if (machine.Starting && !machine.Running) {
+      logger.warn({ machineName }, 'Podman machine stuck in starting state; forcing stop');
+      try {
+        execSync(`podman machine stop ${machineName}`, { stdio: 'pipe', timeout: 30000 });
+      } catch {
+        // Best effort: a stale "starting" state may not stop cleanly.
+      }
+    } else if (machine.Running) {
+      logger.warn({ machineName }, 'Podman machine reports running but API is unavailable; restarting');
+      try {
+        execSync(`podman machine stop ${machineName}`, { stdio: 'pipe', timeout: 30000 });
+      } catch {
+        // Best effort before restart.
+      }
+    }
+
+    execSync(`podman machine start ${machineName}`, { stdio: 'pipe', timeout: 180000 });
+  } catch (err) {
+    logger.error({ err, machineName }, 'Failed to start Podman machine');
+    throw err;
+  }
+
+  if (await waitForPodmanApi(120000)) {
+    logger.info({ machineName }, 'Podman runtime recovered');
+    return;
+  }
+
+  throw new Error('Podman machine started but API did not become ready');
+}
+
+function cleanupOrphanedPodmanContainers(): void {
+  try {
+    const output = execSync('podman ps --format json', {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+    });
+    const containers: Array<{ Names?: string[] | string }> = JSON.parse(
+      output || '[]',
+    );
+    const names = containers.flatMap((c) => {
+      if (Array.isArray(c.Names)) return c.Names;
+      return c.Names ? [c.Names] : [];
+    });
+    const orphans = names.filter((n) => n.startsWith('nanoclaw-'));
+    for (const name of orphans) {
+      try {
+        execSync(`podman stop ${name}`, { stdio: 'pipe' });
+      } catch {
+        // Best-effort cleanup
+      }
+    }
+    if (orphans.length > 0) {
+      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned podman containers');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to clean up orphaned podman containers');
+  }
+}
+
+async function ensureContainerSystemRunning(): Promise<void> {
   if (CONTAINER_RUNTIME === 'podman') {
     try {
-      execSync('podman info', { stdio: 'pipe' });
-      logger.debug('Podman runtime available');
+      await ensurePodmanRuntimeAvailable();
+      cleanupOrphanedPodmanContainers();
+      ensurePodmanImageAvailable();
     } catch (err) {
-      logger.error({ err }, 'Podman runtime unavailable');
+      logger.error({ err }, 'Podman runtime/image setup failed');
       console.error(
         '\n╔════════════════════════════════════════════════════════════════╗',
       );
       console.error(
-        '║  FATAL: Podman is required but unavailable                     ║',
+        '║  FATAL: Podman setup failed                                     ║',
       );
       console.error(
         '║                                                                ║',
       );
       console.error(
-        '║  Ensure podman machine is running and podman is in PATH.       ║',
+        '║  Could not start Podman runtime or prepare container image.    ║',
       );
       console.error(
-        '║  Then restart NanoClaw.                                        ║',
+        '║  Check: podman machine list / podman machine start             ║',
       );
       console.error(
         '╚════════════════════════════════════════════════════════════════╝\n',
       );
       throw new Error('Podman is required but not available');
-    }
-
-    try {
-      const output = execSync('podman ps --format json', {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        encoding: 'utf-8',
-      });
-      const containers: Array<{ Names?: string[] | string }> = JSON.parse(
-        output || '[]',
-      );
-      const names = containers.flatMap((c) => {
-        if (Array.isArray(c.Names)) return c.Names;
-        return c.Names ? [c.Names] : [];
-      });
-      const orphans = names.filter((n) => n.startsWith('nanoclaw-'));
-      for (const name of orphans) {
-        try {
-          execSync(`podman stop ${name}`, { stdio: 'pipe' });
-        } catch {
-          // Best-effort cleanup
-        }
-      }
-      if (orphans.length > 0) {
-        logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned podman containers');
-      }
-    } catch (err) {
-      logger.warn({ err }, 'Failed to clean up orphaned podman containers');
     }
     return;
   }
@@ -925,7 +1073,7 @@ function ensureContainerSystemRunning(): void {
 }
 
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
+  await ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();

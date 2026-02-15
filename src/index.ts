@@ -288,6 +288,17 @@ function mainSender(): string {
   return `MAIN(${MAIN_PROVIDER},${mainLlm})`;
 }
 
+function defaultSenderForGroup(sourceGroup: string): string {
+  if (sourceGroup === MAIN_GROUP_FOLDER) {
+    return mainSender();
+  }
+
+  const groupName = Object.values(registeredGroups).find(
+    (g) => g.folder === sourceGroup,
+  )?.name;
+  return groupName?.trim() || sourceGroup;
+}
+
 let channels: Channel[] = [];
 const queue = new GroupQueue();
 
@@ -1183,6 +1194,7 @@ async function main(): Promise<void> {
       logger.warn({ jid }, 'No channel with file support found for IPC file');
       return Promise.resolve();
     },
+    defaultSenderForGroup,
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroupMetadata: async () => {},

@@ -18,6 +18,7 @@ export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   sendImage: (jid: string, buffer: Buffer, filename: string, mimetype: string, caption?: string) => Promise<void>;
   sendFile: (jid: string, buffer: Buffer, filename: string, mimetype: string, caption?: string) => Promise<void>;
+  defaultSenderForGroup: (sourceGroup: string) => string;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -82,7 +83,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   const sender =
                     typeof data.sender === 'string' && data.sender.trim()
                       ? data.sender.trim()
-                      : 'main';
+                      : deps.defaultSenderForGroup(sourceGroup);
                   await deps.sendMessage(
                     data.chatJid,
                     `${sender}: ${data.text}`,

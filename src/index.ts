@@ -60,8 +60,37 @@ let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 const QUEUED_ACK_COOLDOWN_MS = 30_000;
 const lastQueuedAckAt: Record<string, number> = {};
-const STATUS_REQUEST_PATTERN = /\b(progress|status|update|report)\b/i;
+const ACTIVE_PIPE_ACK_COOLDOWN_MS = 5_000;
+const lastActivePipeAckAt: Record<string, number> = {};
+const STATUS_REQUEST_PATTERN = /\b(progress|status|report)\b/i;
+const ACTIVITY_STATUS_PATTERN =
+  /\b(what are you doing|what are you working on|what's happening|whats happening|where are you at|how's it going|hows it going)\b/i;
+const HEARTBEAT_ONLY_PATTERN = /^(?:@[^\s]+\s+)?(?:ping|heartbeat|hello|hi|hey|are you there|check[-\s]?in)\b[\s!?.,:;]*$/i;
+const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+const STATUS_NUDGE_STALE_MS = 45_000;
+const STATUS_NUDGE_COOLDOWN_MS = 90_000;
+const RUN_PROGRESS_NUDGE_STALE_MS = 90_000;
+const RUN_PROGRESS_NUDGE_COOLDOWN_MS = 120_000;
+const RUN_PROGRESS_NUDGE_CHECK_MS = 15_000;
 const PROJECT_ENV_PATH = path.join(process.cwd(), '.env');
+const MAIN_MODEL_ENV_KEY = 'ANTHROPIC_MODEL';
+
+interface ChatActivity {
+  runStartedAt?: number;
+  currentObjective?: string;
+  currentObjectiveAt?: number;
+  recentUserContext?: string[];
+  lastProgress?: string;
+  lastProgressAt?: number;
+  lastCompletion?: string;
+  lastCompletionAt?: number;
+  lastError?: string;
+  lastErrorAt?: number;
+}
+
+const chatActivity: Record<string, ChatActivity> = {};
+const lastStatusNudgeAt: Record<string, number> = {};
+const CHAT_ACTIVITY_STATE_PREFIX = 'chat_activity:';
 
 function firstSet(...values: Array<string | undefined>): string | undefined {
   for (const v of values) {
@@ -112,8 +141,30 @@ function getConfiguredEnv(key: string): string | undefined {
   return firstSet(process.env[key], PROJECT_ENV[key]);
 }
 
+function isOllamaAnthropicBaseUrl(baseUrl: string | undefined): boolean {
+  const trimmed = baseUrl?.trim();
+  if (!trimmed) return false;
+
+  const normalized = trimmed.toLowerCase();
+  if (normalized.includes('ollama')) return true;
+
+  try {
+    const parsed = new URL(trimmed);
+    const port =
+      parsed.port ||
+      (parsed.protocol === 'https:' ? '443' : parsed.protocol === 'http:' ? '80' : '');
+    return port === '11434';
+  } catch {
+    return false;
+  }
+}
+
+function isMainConfiguredForOllama(): boolean {
+  return isOllamaAnthropicBaseUrl(getConfiguredEnv('ANTHROPIC_BASE_URL'));
+}
+
 function resolveConfiguredMainModel(): string | undefined {
-  return getConfiguredEnv('NANOCLAW_MAIN_MODEL')?.trim() || undefined;
+  return getConfiguredEnv(MAIN_MODEL_ENV_KEY)?.trim() || undefined;
 }
 
 function parseNumber(value: unknown): number {
@@ -185,9 +236,7 @@ function getClaudeModelFromStatsCache(): string | undefined {
 }
 
 function resolveMainProvider(): 'claude' | 'ollama' {
-  const anthropicBaseUrl =
-    (getConfiguredEnv('ANTHROPIC_BASE_URL') || '').toLowerCase();
-  if (anthropicBaseUrl.includes('ollama')) {
+  if (isMainConfiguredForOllama()) {
     return 'ollama';
   }
   return 'claude';
@@ -239,39 +288,16 @@ function normalizeMainLlm(model: string | undefined): string | undefined {
   return undefined;
 }
 function resolveMainLlm(): string {
-  // Explicit MAIN model override first.
-  const directModel = resolveConfiguredMainModel();
-  if (directModel) return directModel;
+  const configuredModel = normalizeMainLlm(resolveConfiguredMainModel());
+  if (configuredModel) return configuredModel;
 
-  // If Anthropic endpoint is redirected to Ollama, prefer Ollama model env.
-  const anthropicBaseUrl =
-    (getConfiguredEnv('ANTHROPIC_BASE_URL') || '').toLowerCase();
-  if (anthropicBaseUrl.includes('ollama')) {
-    const ollamaModel = normalizeMainLlm(
-      firstSet(getConfiguredEnv('OLLAMA_MODEL'), getConfiguredEnv('MODEL')),
-    );
-    if (ollamaModel) return ollamaModel;
-  }
-
-  // For native Claude sessions, wait for runtime init.model so label is exact.
   if (resolveMainProvider() === 'claude') {
     const statsModel = normalizeMainLlm(getClaudeModelFromStatsCache());
     if (statsModel) return statsModel;
     return 'unknown-model';
   }
 
-  // Generic fallback for other redirected providers.
-  return (
-    normalizeMainLlm(
-      firstSet(
-        getConfiguredEnv('OLLAMA_MODEL'),
-        getConfiguredEnv('OPENAI_MODEL'),
-        getConfiguredEnv('MODEL'),
-        getConfiguredEnv('GEMINI_MODEL'),
-        getConfiguredEnv('CODEX_MODEL'),
-      ),
-    ) || 'unknown-model'
-  );
+  return 'unknown-model';
 }
 const MAIN_PROVIDER = resolveMainProvider();
 let mainLlm = resolveMainLlm();
@@ -297,6 +323,368 @@ function defaultSenderForGroup(sourceGroup: string): string {
     (g) => g.folder === sourceGroup,
   )?.name;
   return groupName?.trim() || sourceGroup;
+}
+
+function getMainChatJid(): string | undefined {
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.folder === MAIN_GROUP_FOLDER) return jid;
+  }
+  return undefined;
+}
+
+function formatMainMessage(body: string): string {
+  return `${mainSender()}:\n\n${body.trim()}`;
+}
+
+function chatActivityStateKey(chatJid: string): string {
+  return `${CHAT_ACTIVITY_STATE_PREFIX}${encodeURIComponent(chatJid)}`;
+}
+
+function sanitizeActivity(raw: unknown): ChatActivity {
+  if (!raw || typeof raw !== 'object') return {};
+  const record = raw as Record<string, unknown>;
+  const out: ChatActivity = {};
+  if (typeof record.runStartedAt === 'number') out.runStartedAt = record.runStartedAt;
+  if (typeof record.currentObjective === 'string') out.currentObjective = record.currentObjective;
+  if (typeof record.currentObjectiveAt === 'number') out.currentObjectiveAt = record.currentObjectiveAt;
+  if (typeof record.lastProgress === 'string') out.lastProgress = record.lastProgress;
+  if (typeof record.lastProgressAt === 'number') out.lastProgressAt = record.lastProgressAt;
+  if (typeof record.lastCompletion === 'string') out.lastCompletion = record.lastCompletion;
+  if (typeof record.lastCompletionAt === 'number') out.lastCompletionAt = record.lastCompletionAt;
+  if (typeof record.lastError === 'string') out.lastError = record.lastError;
+  if (typeof record.lastErrorAt === 'number') out.lastErrorAt = record.lastErrorAt;
+  if (Array.isArray(record.recentUserContext)) {
+    out.recentUserContext = record.recentUserContext
+      .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+      .map((v) => v.trim())
+      .slice(-6);
+  }
+  return out;
+}
+
+function persistChatActivity(chatJid: string): void {
+  const activity = chatActivity[chatJid];
+  if (!activity) return;
+  try {
+    setRouterState(chatActivityStateKey(chatJid), JSON.stringify(activity));
+  } catch (err) {
+    logger.warn({ err, chatJid }, 'Failed to persist chat activity');
+  }
+}
+
+function isStatusProbe(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  return (
+    STATUS_REQUEST_PATTERN.test(trimmed) ||
+    ACTIVITY_STATUS_PATTERN.test(trimmed)
+  );
+}
+
+function ensureChatActivity(chatJid: string): ChatActivity {
+  if (!chatActivity[chatJid]) {
+    const persisted = getRouterState(chatActivityStateKey(chatJid));
+    if (persisted) {
+      try {
+        chatActivity[chatJid] = sanitizeActivity(JSON.parse(persisted));
+      } catch {
+        chatActivity[chatJid] = {};
+      }
+    } else {
+      chatActivity[chatJid] = {};
+    }
+  }
+  return chatActivity[chatJid];
+}
+
+function compactMessage(text: string, maxLen = 220): string | undefined {
+  let compact = text.trim();
+  if (!compact) return undefined;
+  if (TRIGGER_PATTERN.test(compact)) {
+    compact = compact.replace(TRIGGER_PATTERN, '').trim();
+  }
+  compact = compact.replace(/\s+/g, ' ').trim();
+  if (!compact) return undefined;
+  return compact.length > maxLen ? `${compact.slice(0, maxLen)}...` : compact;
+}
+
+function setCurrentObjective(chatJid: string, objective: string): void {
+  const compact = compactMessage(objective, 180);
+  if (!compact) return;
+  const activity = ensureChatActivity(chatJid);
+  activity.currentObjective = compact;
+  activity.currentObjectiveAt = Date.now();
+  persistChatActivity(chatJid);
+}
+
+function recordUserContext(chatJid: string, text: string): void {
+  const compact = compactMessage(text, 220);
+  if (!compact) return;
+  const activity = ensureChatActivity(chatJid);
+  const existing = activity.recentUserContext || [];
+  const next = [...existing.filter((v) => v !== compact), compact].slice(-6);
+  activity.recentUserContext = next;
+  persistChatActivity(chatJid);
+}
+
+function setObjectiveFromMessages(chatJid: string, messages: NewMessage[]): void {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const content = messages[i].content.trim();
+    if (!content) continue;
+    if (isStatusProbe(content)) continue;
+    if (HEARTBEAT_ONLY_PATTERN.test(content)) continue;
+    recordUserContext(chatJid, content);
+    setCurrentObjective(chatJid, content);
+    return;
+  }
+}
+
+function markRunStarted(chatJid: string): void {
+  const activity = ensureChatActivity(chatJid);
+  activity.runStartedAt = Date.now();
+  persistChatActivity(chatJid);
+}
+
+function markRunEnded(chatJid: string): void {
+  const activity = ensureChatActivity(chatJid);
+  activity.runStartedAt = undefined;
+  persistChatActivity(chatJid);
+}
+
+function markProgress(chatJid: string, progress: string): void {
+  const compact = compactMessage(progress);
+  if (!compact) return;
+  const activity = ensureChatActivity(chatJid);
+  activity.lastProgress = compact;
+  activity.lastProgressAt = Date.now();
+  persistChatActivity(chatJid);
+}
+
+function markCompletion(chatJid: string, completion: string): void {
+  const compact = compactMessage(completion);
+  if (!compact) return;
+  const activity = ensureChatActivity(chatJid);
+  activity.lastCompletion = compact;
+  activity.lastCompletionAt = Date.now();
+  persistChatActivity(chatJid);
+}
+
+function markError(chatJid: string, error: string): void {
+  const compact = compactMessage(error);
+  if (!compact) return;
+  const activity = ensureChatActivity(chatJid);
+  activity.lastError = compact;
+  activity.lastErrorAt = Date.now();
+  persistChatActivity(chatJid);
+}
+
+function formatDuration(ms: number): string {
+  const seconds = Math.max(1, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  if (hours < 24) return remMinutes > 0 ? `${hours}h ${remMinutes}m` : `${hours}h`;
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  return remHours > 0 ? `${days}d ${remHours}h` : `${days}d`;
+}
+
+function statusTextForChat(chatJid: string, includeTodoReminder: boolean): string {
+  const snapshot = queue.getGroupStatus(chatJid);
+  const runtimeActive = hasRuntimeActiveGroupRun(chatJid);
+  const activity = ensureChatActivity(chatJid);
+  const now = Date.now();
+
+  if (snapshot.active || runtimeActive) {
+    const parts: string[] = ['status: active run.'];
+    if (activity.runStartedAt) {
+      parts.push(`elapsed: ${formatDuration(now - activity.runStartedAt)}.`);
+    }
+    if (activity.currentObjective) {
+      parts.push(`objective: ${activity.currentObjective}.`);
+    }
+    if (activity.lastProgress) {
+      const age = activity.lastProgressAt
+        ? formatDuration(now - activity.lastProgressAt)
+        : 'unknown';
+      parts.push(`latest: ${activity.lastProgress} (${age} ago).`);
+    } else if (activity.runStartedAt && now - activity.runStartedAt >= STATUS_NUDGE_STALE_MS) {
+      parts.push('latest: no output yet; run is still active.');
+    }
+    if (snapshot.pendingTasks > 0) {
+      parts.push(
+        `queued tasks: ${snapshot.pendingTasks}.`,
+      );
+    }
+    return parts.join(' ');
+  }
+
+  if (snapshot.pendingMessages || snapshot.pendingTasks > 0 || snapshot.waitingForSlot) {
+    const parts = ['status: queued and waiting for execution slot.'];
+    if (activity.currentObjective) {
+      parts.push(`next objective: ${activity.currentObjective}.`);
+    }
+    if (snapshot.pendingTasks > 0) {
+      parts.push(`queued tasks: ${snapshot.pendingTasks}.`);
+    }
+    return parts.join(' ');
+  }
+
+  const idleParts: string[] = ['status: idle.'];
+  if (activity.lastCompletion) {
+    const age = activity.lastCompletionAt
+      ? formatDuration(now - activity.lastCompletionAt)
+      : 'unknown';
+    idleParts.push(`last completion ${age} ago: ${activity.lastCompletion}.`);
+  }
+  if (activity.lastError) {
+    const age = activity.lastErrorAt
+      ? formatDuration(now - activity.lastErrorAt)
+      : 'unknown';
+    idleParts.push(`last error ${age} ago: ${activity.lastError}.`);
+  }
+  if (includeTodoReminder && chatJid === getMainChatJid()) {
+    idleParts.push('next step: pick the highest-priority pending item from groups/global/CLAUDE.md.');
+  }
+  return idleParts.join(' ');
+}
+
+function maybeNudgeActiveRunForStatus(chatJid: string): boolean {
+  const snapshot = queue.getGroupStatus(chatJid);
+  if (!snapshot.active) return false;
+
+  const activity = ensureChatActivity(chatJid);
+  const now = Date.now();
+  const lastProgressAt = activity.lastProgressAt || activity.runStartedAt || 0;
+  if (!lastProgressAt || now - lastProgressAt < STATUS_NUDGE_STALE_MS) return false;
+
+  const lastNudgeAt = lastStatusNudgeAt[chatJid] || 0;
+  if (now - lastNudgeAt < STATUS_NUDGE_COOLDOWN_MS) return false;
+
+  const nudge =
+    'Status check requested by user. Reply now with a concise concrete progress update: what is done, what is running, and next step.';
+  if (!queue.sendMessage(chatJid, nudge)) return false;
+
+  lastStatusNudgeAt[chatJid] = now;
+  logger.info({ chatJid }, 'Sent status nudge to active run');
+  return true;
+}
+
+function buildMainMissionContext(chatJid: string): string | undefined {
+  const activity = ensureChatActivity(chatJid);
+  const lines: string[] = [];
+
+  if (activity.currentObjective) {
+    lines.push(`Current objective: ${activity.currentObjective}`);
+  }
+  if (activity.recentUserContext && activity.recentUserContext.length > 0) {
+    lines.push('Recent user context:');
+    for (const item of activity.recentUserContext.slice(-4)) {
+      lines.push(`- ${item}`);
+    }
+  }
+  if (activity.lastCompletion) {
+    lines.push(`Last completion: ${activity.lastCompletion}`);
+  }
+  if (activity.lastError) {
+    lines.push(`Last error: ${activity.lastError}`);
+  }
+
+  if (lines.length === 0) return undefined;
+  return [
+    '[Persistent mission context - carry this forward unless user changes priorities]',
+    ...lines,
+  ].join('\n');
+}
+
+function runtimeHealthy(): boolean {
+  if (CONTAINER_RUNTIME === 'podman') {
+    return canReachPodmanApi();
+  }
+
+  try {
+    execSync('container system status', { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasRuntimeActiveGroupRun(chatJid: string): boolean {
+  const group = registeredGroups[chatJid];
+  if (!group) return false;
+
+  const safeFolder = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
+  const prefix = `nanoclaw-${safeFolder}-`;
+
+  if (CONTAINER_RUNTIME === 'podman') {
+    try {
+      const output = execSync('podman ps --format json', {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        encoding: 'utf-8',
+      });
+      const parsed: unknown = JSON.parse(output || '[]');
+      if (!Array.isArray(parsed)) return false;
+      return parsed.some((entry) => {
+        if (!entry || typeof entry !== 'object') return false;
+        const record = entry as Record<string, unknown>;
+        const namesRaw = record.Names ?? record.Name;
+        const names = Array.isArray(namesRaw)
+          ? namesRaw.filter((n): n is string => typeof n === 'string')
+          : typeof namesRaw === 'string'
+            ? [namesRaw]
+            : [];
+        return names.some((n) => n.startsWith(prefix));
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  try {
+    const output = execSync('container ls --format json', {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+    });
+    const parsed: unknown = JSON.parse(output || '[]');
+    if (!Array.isArray(parsed)) return false;
+    return parsed.some((entry) => {
+      if (!entry || typeof entry !== 'object') return false;
+      const record = entry as {
+        status?: string;
+        configuration?: { id?: string };
+      };
+      return (
+        record.status === 'running' &&
+        typeof record.configuration?.id === 'string' &&
+        record.configuration.id.startsWith(prefix)
+      );
+    });
+  } catch {
+    return false;
+  }
+}
+
+function heartbeatTextForChat(chatJid: string, includeTodoReminder = false): string {
+  const healthy = channels.length > 0 && runtimeHealthy();
+  return healthy
+    ? `heartbeat: online. ${statusTextForChat(chatJid, includeTodoReminder)}`
+    : `heartbeat: degraded. check runtime/channel health, then continue from groups/global/CLAUDE.md.`;
+}
+
+async function sendHeartbeat(chatJid: string, includeTodoReminder = false): Promise<void> {
+  const ch = findChannel(channels, chatJid);
+  if (!ch) return;
+  try {
+    await ch.sendMessage(
+      chatJid,
+      formatMainMessage(heartbeatTextForChat(chatJid, includeTodoReminder)),
+    );
+  } catch (err) {
+    logger.warn({ err, chatJid }, 'Failed to send heartbeat');
+  }
 }
 
 let channels: Channel[] = [];
@@ -459,7 +847,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages);
+  setObjectiveFromMessages(chatJid, missedMessages);
+
+  const basePrompt = formatMessages(missedMessages);
+  const missionContext =
+    isMainGroup ? buildMainMissionContext(chatJid) : undefined;
+  const prompt = missionContext
+    ? `${missionContext}\n\n${basePrompt}`
+    : basePrompt;
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -489,6 +884,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
   const agentResponses: string[] = [];
+  let lastResponseBody: string | undefined;
+  let lastRunOutputAt = Date.now();
+  let lastRunProgressNudgeAt = 0;
+  let runProgressNudgeTimer: ReturnType<typeof setInterval> | null = null;
+
+  markRunStarted(chatJid);
+
+  if (isMainGroup) {
+    runProgressNudgeTimer = setInterval(() => {
+      const now = Date.now();
+      if (now - lastRunOutputAt < RUN_PROGRESS_NUDGE_STALE_MS) return;
+      if (now - lastRunProgressNudgeAt < RUN_PROGRESS_NUDGE_COOLDOWN_MS) return;
+      const nudged = queue.sendMessage(
+        chatJid,
+        'If you are still running, send a concise progress update now: done, in-progress, next.',
+      );
+      if (nudged) {
+        lastRunProgressNudgeAt = now;
+        logger.info({ chatJid }, 'Sent automatic run-progress nudge');
+      }
+    }, RUN_PROGRESS_NUDGE_CHECK_MS);
+  }
 
   const runResult = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -501,13 +918,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
+        markProgress(chatJid, text);
+        lastResponseBody = text;
+        lastRunOutputAt = Date.now();
         const ch = findChannel(channels, chatJid);
         if (ch) {
-          const prefixed = `${mainSender()}: ${text}`;
-          await ch.sendMessage(chatJid, prefixed);
+          await ch.sendMessage(chatJid, formatMainMessage(text));
         }
         outputSentToUser = true;
-        agentResponses.push(`${mainSender()}: ${text}`);
+        agentResponses.push(formatMainMessage(text));
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -515,21 +934,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     if (result.status === 'error') {
       hadError = true;
+      if (result.error) {
+        markError(chatJid, result.error);
+      }
     }
   });
 
   if (channel?.setTyping) await channel.setTyping(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+  if (runProgressNudgeTimer) clearInterval(runProgressNudgeTimer);
 
   if (runResult.status === 'error' || hadError) {
     const rawError =
       runResult.error ||
       (hadError ? 'agent returned an error status' : 'unknown error');
     const compactError = rawError.replace(/\s+/g, ' ').slice(0, 220);
+    markError(chatJid, compactError);
 
     if (!outputSentToUser && channel) {
       const errorReply =
-        `${mainSender()}: I hit an error while processing that request: ${compactError}`;
+        formatMainMessage(
+          `I hit an error while processing that request: ${compactError}`,
+        );
       try {
         await channel.sendMessage(chatJid, errorReply);
         outputSentToUser = true;
@@ -547,15 +973,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (outputSentToUser) {
       logger.warn({ group: group.name }, 'Agent error after output was sent, skipping cursor rollback to prevent duplicates');
       appendConversationLog(group.folder, missedMessages, agentResponses, channel?.name);
+      markRunEnded(chatJid);
       return true;
     }
     // Roll back cursor so retries can re-process these messages
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
     logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
+    markRunEnded(chatJid);
     return false;
   }
 
+  if (lastResponseBody) {
+    markCompletion(chatJid, lastResponseBody);
+  }
+  markRunEnded(chatJid);
   appendConversationLog(group.folder, missedMessages, agentResponses, channel?.name);
   return true;
 }
@@ -705,59 +1137,82 @@ async function startMessageLoop(): Promise<void> {
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
           const statusMessages = messagesToSend.filter((m) =>
-            STATUS_REQUEST_PATTERN.test(m.content.trim()),
+            isStatusProbe(m.content),
           );
-          const nonStatusMessages = messagesToSend.filter(
-            (m) => !STATUS_REQUEST_PATTERN.test(m.content.trim()),
+          const hasHeartbeatRequest = messagesToSend.some((m) =>
+            HEARTBEAT_ONLY_PATTERN.test(m.content.trim()),
           );
           const hasStatusRequest = statusMessages.length > 0;
 
+          if (hasHeartbeatRequest) {
+            await sendHeartbeat(chatJid, true);
+          }
+
           if (hasStatusRequest) {
-            const now = Date.now();
-            if (
-              !lastQueuedAckAt[chatJid] ||
-              now - lastQueuedAckAt[chatJid] >= QUEUED_ACK_COOLDOWN_MS
-            ) {
-              const snapshot = queue.getGroupStatus(chatJid);
-              const statusLine = snapshot.active
-                ? `observed status: active run in progress${snapshot.pendingTasks > 0 ? ` (${snapshot.pendingTasks} queued task${snapshot.pendingTasks === 1 ? '' : 's'})` : ''}.`
-                : snapshot.pendingMessages || snapshot.pendingTasks > 0 || snapshot.waitingForSlot
-                  ? 'observed status: work is queued and waiting to run.'
-                  : 'observed status: no active run right now.';
-              const ch = findChannel(channels, chatJid);
-              if (ch) {
-                try {
-                  await ch.sendMessage(
-                    chatJid,
-                    `${mainSender()}: ${statusLine}`,
-                  );
-                  lastQueuedAckAt[chatJid] = now;
-                } catch (err) {
-                  logger.warn(
-                    { chatJid, err },
-                    'Failed to send observed status acknowledgement',
-                  );
-                }
+            const ch = findChannel(channels, chatJid);
+            if (ch) {
+              try {
+                const nudged = maybeNudgeActiveRunForStatus(chatJid);
+                await ch.sendMessage(
+                  chatJid,
+                  formatMainMessage(
+                    `observed ${statusTextForChat(chatJid, true)}${nudged ? ' requested a live check-in from the active run.' : ''}`,
+                  ),
+                );
+              } catch (err) {
+                logger.warn(
+                  { chatJid, err },
+                  'Failed to send observed status acknowledgement',
+                );
               }
             }
           }
 
-          // Status-only prompts are answered by observed state and should not
+          const nonProbeMessages = messagesToSend.filter(
+            (m) =>
+              !isStatusProbe(m.content) &&
+              !HEARTBEAT_ONLY_PATTERN.test(m.content.trim()),
+          );
+
+          // Probe-only prompts are answered by observed state/heartbeat and should not
           // be piped into active runs.
-          if (nonStatusMessages.length === 0) {
+          if (nonProbeMessages.length === 0) {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
             continue;
           }
 
-          const formatted = formatMessages(nonStatusMessages);
+          setObjectiveFromMessages(chatJid, nonProbeMessages);
+          const formatted = formatMessages(nonProbeMessages);
 
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
-              { chatJid, count: nonStatusMessages.length },
+              { chatJid, count: nonProbeMessages.length },
               'Piped messages to active container',
             );
+            const now = Date.now();
+            if (
+              !lastActivePipeAckAt[chatJid] ||
+              now - lastActivePipeAckAt[chatJid] >= ACTIVE_PIPE_ACK_COOLDOWN_MS
+            ) {
+              const ch = findChannel(channels, chatJid);
+              const objective = compactMessage(
+                nonProbeMessages[nonProbeMessages.length - 1]?.content || '',
+                120,
+              );
+              if (ch) {
+                void ch.sendMessage(
+                  chatJid,
+                  formatMainMessage(
+                    `received and injected into active run.${objective ? ` request: ${objective}.` : ''}`,
+                  ),
+                ).catch((err) => {
+                  logger.warn({ chatJid, err }, 'Failed to send active-run acknowledgement');
+                });
+              }
+              lastActivePipeAckAt[chatJid] = now;
+            }
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
@@ -775,11 +1230,15 @@ async function startMessageLoop(): Promise<void> {
               const ch = findChannel(channels, chatJid);
               if (ch) {
                 try {
+                  const objective = compactMessage(
+                    nonProbeMessages[nonProbeMessages.length - 1]?.content || '',
+                    160,
+                  );
                   await ch.sendMessage(
                     chatJid,
-                    hasStatusRequest
-                      ? `${mainSender()}: status request received. I am starting the run now and will send a concrete update shortly.`
-                      : `${mainSender()}: working on it now...`,
+                    formatMainMessage(
+                      `queued and starting run now.${objective ? ` objective: ${objective}.` : ''}`,
+                    ),
                   );
                   lastQueuedAckAt[chatJid] = now;
                 } catch (err) {
@@ -1172,7 +1631,7 @@ async function main(): Promise<void> {
       const ch = findChannel(channels, jid);
       if (!ch) return;
       const text = stripInternalTags(rawText);
-      if (text) await ch.sendMessage(jid, `${mainSender()}: ${text}`);
+      if (text) await ch.sendMessage(jid, formatMainMessage(text));
     },
   });
   startIpcWatcher({
@@ -1182,6 +1641,7 @@ async function main(): Promise<void> {
       logger.warn({ jid }, 'No channel found for IPC message');
       return Promise.resolve();
     },
+    defaultSenderForGroup,
     sendImage: (jid, buffer, filename, mimetype, caption) => {
       const ch = findChannel(channels, jid);
       if (ch?.sendImage) return ch.sendImage(jid, buffer, filename, mimetype, caption);
@@ -1194,7 +1654,6 @@ async function main(): Promise<void> {
       logger.warn({ jid }, 'No channel with file support found for IPC file');
       return Promise.resolve();
     },
-    defaultSenderForGroup,
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroupMetadata: async () => {},
@@ -1204,6 +1663,20 @@ async function main(): Promise<void> {
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
   startMessageLoop();
+
+  setInterval(async () => {
+    const mainChatJid = getMainChatJid();
+    if (!mainChatJid) return;
+    const snapshot = queue.getGroupStatus(mainChatJid);
+    const shouldHeartbeat =
+      snapshot.active ||
+      snapshot.pendingMessages ||
+      snapshot.pendingTasks > 0 ||
+      snapshot.waitingForSlot ||
+      hasRuntimeActiveGroupRun(mainChatJid);
+    if (!shouldHeartbeat) return;
+    await sendHeartbeat(mainChatJid, false);
+  }, HEARTBEAT_INTERVAL_MS);
 }
 
 // Guard: only run when executed directly, not when imported by tests

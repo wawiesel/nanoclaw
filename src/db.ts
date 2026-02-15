@@ -297,6 +297,24 @@ export function getMessagesSince(
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`) as NewMessage[];
 }
 
+export function getRecentMessages(
+  chatJid: string,
+  botPrefix: string,
+  limit = 25,
+): NewMessage[] {
+  const safeLimit = Math.max(1, Math.min(limit, 200));
+  const sql = `
+    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    FROM messages
+    WHERE chat_jid = ? AND content NOT LIKE ?
+    ORDER BY timestamp DESC
+    LIMIT ?
+  `;
+  return db
+    .prepare(sql)
+    .all(chatJid, `${botPrefix}:%`, safeLimit) as NewMessage[];
+}
+
 export function createTask(
   task: Omit<ScheduledTask, 'last_run' | 'last_result'>,
 ): void {

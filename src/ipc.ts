@@ -86,7 +86,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       : deps.defaultSenderForGroup(sourceGroup);
                   await deps.sendMessage(
                     data.chatJid,
-                    `${sender}: ${data.text}`,
+                    `${sender}:\n\n${String(data.text)}`,
                   );
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },

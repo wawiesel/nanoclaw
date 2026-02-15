@@ -59,18 +59,37 @@ const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 const DOCLING_VENV_BIN = '/workspace/cache/venvs/docling_venv/bin';
-const MAIN_MODEL_ENV_KEY = 'NANOCLAW_MAIN_MODEL';
+const MAIN_MODEL_ENV_KEY = 'ANTHROPIC_MODEL';
 const TOOL_PROGRESS_EMIT_MS = 15_000;
 const GENERAL_PROGRESS_DEDUPE_MS = 5_000;
+const SDK_PROCESS_ENV_KEYS = [
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_MODEL',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'NO_PROXY',
+  'SSL_CERT_FILE',
+  'NODE_EXTRA_CA_CERTS',
+  'REQUESTS_CA_BUNDLE',
+  'CURL_CA_BUNDLE',
+  'GIT_SSL_CAINFO',
+  'NODE_TLS_REJECT_UNAUTHORIZED',
+] as const;
 const MAIN_DELEGATE_POLICY = `Main thread policy:
-- You are an orchestrator who can also do short exploratory work directly.
-- You own final quality: verify all work, take responsibility for results, and do not outsource accountability.
-- Track model performance by task type, choose the model that fits each task, and optimize thread throughput/responsiveness.
-- Do not overuse delegates. Delegate only when you understand the task well enough to specify and verify it.
-- First, blaze a trail when needed: run targeted preflight checks, prove the workflow on a small slice, and identify exact commands/paths.
-- Then delegate the scaled execution via mcp__nanoclaw__delegate_codex, mcp__nanoclaw__delegate_gemini, or mcp__nanoclaw__delegate_ollama with concrete instructions.
-- Keep MAIN responsive: acknowledge briefly, report what you validated yourself, and monitor/correct delegate runs.
-- Avoid doing bulk execution in MAIN once a delegate can execute the proven path.`;
+- You are one identity (johnny5-bot) operating in dispatcher/worker mode.
+- MAIN must stay chat-responsive while work runs in background workers.
+- Use MAIN for short trailblazing only: quick preflight checks, prove commands/paths on a small slice, define acceptance criteria.
+- For multi-step or long-running execution, launch workers via mcp__nanoclaw__delegate_codex, mcp__nanoclaw__delegate_gemini, or mcp__nanoclaw__delegate_ollama.
+- Treat worker output as your own multitasking output; do not present workers as separate assistants.
+- Own final quality: verify completed work, correct drift, and take responsibility for final results.
+- Track model performance by task type and choose worker model/provider intentionally.
+- Do not over-delegate: only delegate once the task is well-specified and verifiable.
+- Keep worker control explicit: use delegate_list/delegate_status/delegate_cancel/delegate_amend to monitor and correct active runs.
+- If user asks "what are you doing" during active work, provide concrete current state (completed, running, next) immediately.`;
 
 const DEFAULT_ALLOWED_TOOLS = [
   'Bash',
@@ -160,6 +179,32 @@ function prependToPath(currentPath: string | undefined, prefix: string): string 
   const parts = currentPath.split(path.delimiter);
   if (parts.includes(prefix)) return currentPath;
   return `${prefix}${path.delimiter}${currentPath}`;
+}
+
+function applySdkProcessEnv(
+  sdkEnv: Record<string, string | undefined>,
+): () => void {
+  const previous: Record<string, string | undefined> = {};
+  for (const key of SDK_PROCESS_ENV_KEYS) {
+    previous[key] = process.env[key];
+    const next = sdkEnv[key];
+    if (typeof next === 'string' && next.length > 0) {
+      process.env[key] = next;
+    } else {
+      delete process.env[key];
+    }
+  }
+
+  return () => {
+    for (const key of SDK_PROCESS_ENV_KEYS) {
+      const prior = previous[key];
+      if (typeof prior === 'string') {
+        process.env[key] = prior;
+      } else {
+        delete process.env[key];
+      }
+    }
+  };
 }
 
 /**
@@ -356,6 +401,35 @@ function parseTranscript(content: string): ParsedMessage[] {
   return messages;
 }
 
+function extractAssistantText(message: unknown): string {
+  if (!message || typeof message !== 'object') return '';
+
+  const record = message as Record<string, unknown>;
+  const fromEnvelope = record.message;
+  const payload =
+    fromEnvelope && typeof fromEnvelope === 'object'
+      ? (fromEnvelope as Record<string, unknown>).content
+      : record.content;
+
+  if (typeof payload === 'string') {
+    return payload.trim();
+  }
+
+  if (!Array.isArray(payload)) return '';
+
+  const parts: string[] = [];
+  for (const item of payload) {
+    if (!item || typeof item !== 'object') continue;
+    const chunk = item as Record<string, unknown>;
+    if (chunk.type !== 'text') continue;
+    if (typeof chunk.text === 'string' && chunk.text.trim()) {
+      parts.push(chunk.text.trim());
+    }
+  }
+
+  return parts.join('\n').trim();
+}
+
 function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null): string {
   const now = new Date();
   const formatDateTime = (d: Date) => d.toLocaleString('en-US', {
@@ -502,6 +576,7 @@ async function runQuery(
   const lastToolProgressAt = new Map<string, number>();
   let lastProgressText = '';
   let lastProgressAt = 0;
+  let lastAssistantText = '';
 
   const emitProgress = (text: string): void => {
     const normalized = text.replace(/\r/g, '').replace(/\s+/g, ' ').trim();
@@ -563,74 +638,84 @@ async function runQuery(
   }
   const mainModel = mainIsClaude ? configuredMainModel : undefined;
 
-  for await (const message of query({
-    prompt: stream,
-    options: {
-      cwd: '/workspace/group',
-      additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
-      resume: sessionId,
-      resumeSessionAt: resumeAt,
-      systemPrompt: systemPromptAppend
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend }
-        : undefined,
-      model: mainModel,
-      allowedTools: [...getAllowedTools(containerInput.isMain)],
-      env: sdkEnv,
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-            ...(sdkEnv.HTTP_PROXY
-              ? { HTTP_PROXY: sdkEnv.HTTP_PROXY }
-              : {}),
-            ...(sdkEnv.HTTPS_PROXY
-              ? { HTTPS_PROXY: sdkEnv.HTTPS_PROXY }
-              : {}),
-            ...(sdkEnv.ALL_PROXY ? { ALL_PROXY: sdkEnv.ALL_PROXY } : {}),
-            ...(sdkEnv.NO_PROXY ? { NO_PROXY: sdkEnv.NO_PROXY } : {}),
-            ...(sdkEnv.SSL_CERT_FILE
-              ? { SSL_CERT_FILE: sdkEnv.SSL_CERT_FILE }
-              : {}),
-            ...(sdkEnv.NODE_EXTRA_CA_CERTS
-              ? { NODE_EXTRA_CA_CERTS: sdkEnv.NODE_EXTRA_CA_CERTS }
-              : {}),
-            ...(sdkEnv.REQUESTS_CA_BUNDLE
-              ? { REQUESTS_CA_BUNDLE: sdkEnv.REQUESTS_CA_BUNDLE }
-              : {}),
-            ...(sdkEnv.CURL_CA_BUNDLE
-              ? { CURL_CA_BUNDLE: sdkEnv.CURL_CA_BUNDLE }
-              : {}),
-            ...(sdkEnv.GIT_SSL_CAINFO
-              ? { GIT_SSL_CAINFO: sdkEnv.GIT_SSL_CAINFO }
-              : {}),
-            ...(sdkEnv.NODE_TLS_REJECT_UNAUTHORIZED
-              ? {
-                  NODE_TLS_REJECT_UNAUTHORIZED:
-                    sdkEnv.NODE_TLS_REJECT_UNAUTHORIZED,
-                }
-              : {}),
+  const restoreSdkProcessEnv = applySdkProcessEnv(sdkEnv);
+  try {
+    for await (const message of query({
+      prompt: stream,
+      options: {
+        cwd: '/workspace/group',
+        additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
+        resume: sessionId,
+        resumeSessionAt: resumeAt,
+        systemPrompt: systemPromptAppend
+          ? { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend }
+          : undefined,
+        model: mainModel,
+        allowedTools: [...getAllowedTools(containerInput.isMain)],
+        env: sdkEnv,
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        settingSources: ['project', 'user'],
+        mcpServers: {
+          nanoclaw: {
+            command: 'node',
+            args: [mcpServerPath],
+            env: {
+              NANOCLAW_CHAT_JID: containerInput.chatJid,
+              NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+              NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+              ...(sdkEnv.HTTP_PROXY
+                ? { HTTP_PROXY: sdkEnv.HTTP_PROXY }
+                : {}),
+              ...(sdkEnv.HTTPS_PROXY
+                ? { HTTPS_PROXY: sdkEnv.HTTPS_PROXY }
+                : {}),
+              ...(sdkEnv.ALL_PROXY ? { ALL_PROXY: sdkEnv.ALL_PROXY } : {}),
+              ...(sdkEnv.NO_PROXY ? { NO_PROXY: sdkEnv.NO_PROXY } : {}),
+              ...(sdkEnv.SSL_CERT_FILE
+                ? { SSL_CERT_FILE: sdkEnv.SSL_CERT_FILE }
+                : {}),
+              ...(sdkEnv.NODE_EXTRA_CA_CERTS
+                ? { NODE_EXTRA_CA_CERTS: sdkEnv.NODE_EXTRA_CA_CERTS }
+                : {}),
+              ...(sdkEnv.REQUESTS_CA_BUNDLE
+                ? { REQUESTS_CA_BUNDLE: sdkEnv.REQUESTS_CA_BUNDLE }
+                : {}),
+              ...(sdkEnv.CURL_CA_BUNDLE
+                ? { CURL_CA_BUNDLE: sdkEnv.CURL_CA_BUNDLE }
+                : {}),
+              ...(sdkEnv.GIT_SSL_CAINFO
+                ? { GIT_SSL_CAINFO: sdkEnv.GIT_SSL_CAINFO }
+                : {}),
+              ...(sdkEnv.NODE_TLS_REJECT_UNAUTHORIZED
+                ? {
+                    NODE_TLS_REJECT_UNAUTHORIZED:
+                      sdkEnv.NODE_TLS_REJECT_UNAUTHORIZED,
+                  }
+                : {}),
+            },
           },
         },
-      },
-      hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook()] }],
-        PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
-      },
-    }
-  })) {
+        hooks: {
+          PreCompact: [{ hooks: [createPreCompactHook()] }],
+          PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
+        },
+      }
+    })) {
     messageCount++;
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+    }
+
+    if (message.type === 'assistant') {
+      const assistantText = extractAssistantText(message);
+      if (assistantText && assistantText !== lastAssistantText) {
+        lastAssistantText = assistantText;
+        emitProgress(assistantText);
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -699,6 +784,19 @@ async function runQuery(
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      const normalizedResult = (textResult || '')
+        .replace(/\r/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (normalizedResult && normalizedResult === lastProgressText) {
+        writeOutput({
+          status: 'success',
+          result: null,
+          newSessionId,
+          model: activeModel,
+        });
+        continue;
+      }
       writeOutput({
         status: 'success',
         result: textResult || null,
@@ -706,6 +804,9 @@ async function runQuery(
         model: activeModel,
       });
     }
+  }
+  } finally {
+    restoreSdkProcessEnv();
   }
 
   ipcPolling = false;

@@ -33,6 +33,7 @@ interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
   newSessionId?: string;
+  model?: string;
   error?: string;
 }
 
@@ -57,6 +58,89 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+const DOCLING_VENV_BIN = '/workspace/cache/venvs/docling_venv/bin';
+const MAIN_MODEL_ENV_KEY = 'NANOCLAW_MAIN_MODEL';
+const MAIN_DELEGATE_POLICY = `Main thread policy:
+- You are an orchestrator who can also do short exploratory work directly.
+- You own final quality: verify all work, take responsibility for results, and do not outsource accountability.
+- Track model performance by task type, choose the model that fits each task, and optimize thread throughput/responsiveness.
+- Do not overuse delegates. Delegate only when you understand the task well enough to specify and verify it.
+- First, blaze a trail when needed: run targeted preflight checks, prove the workflow on a small slice, and identify exact commands/paths.
+- Then delegate the scaled execution via mcp__nanoclaw__delegate_codex, mcp__nanoclaw__delegate_gemini, or mcp__nanoclaw__delegate_ollama with concrete instructions.
+- Keep MAIN responsive: acknowledge briefly, report what you validated yourself, and monitor/correct delegate runs.
+- Avoid doing bulk execution in MAIN once a delegate can execute the proven path.`;
+
+const DEFAULT_ALLOWED_TOOLS = [
+  'Bash',
+  'Read',
+  'Write',
+  'Edit',
+  'Glob',
+  'Grep',
+  'WebSearch',
+  'WebFetch',
+  'Task',
+  'TaskOutput',
+  'TaskStop',
+  'TeamCreate',
+  'TeamDelete',
+  'SendMessage',
+  'TodoWrite',
+  'ToolSearch',
+  'Skill',
+  'NotebookEdit',
+  'mcp__nanoclaw__*',
+] as const;
+
+// MAIN can do direct exploratory work, then delegate scale-out.
+const MAIN_ALLOWED_TOOLS = DEFAULT_ALLOWED_TOOLS;
+
+function getAllowedTools(isMainGroup: boolean): readonly string[] {
+  return isMainGroup ? MAIN_ALLOWED_TOOLS : DEFAULT_ALLOWED_TOOLS;
+}
+
+function firstSet(...values: Array<string | undefined>): string | undefined {
+  for (const v of values) {
+    const s = v?.trim();
+    if (s) return s;
+  }
+  return undefined;
+}
+
+function getRequestedMainModel(env: Record<string, string | undefined>): string | undefined {
+  return firstSet(env[MAIN_MODEL_ENV_KEY]);
+}
+
+function claudeModelFamily(model: string): 'opus' | 'sonnet' | 'haiku' | 'unknown' {
+  const normalized = model.trim().toLowerCase();
+  if (normalized.includes('opus')) return 'opus';
+  if (normalized.includes('sonnet')) return 'sonnet';
+  if (normalized.includes('haiku')) return 'haiku';
+  return 'unknown';
+}
+
+function modelMatchesRequest(requested: string, actual: string): boolean {
+  const req = requested.trim().toLowerCase();
+  const act = actual.trim().toLowerCase();
+  if (!req || !act) return false;
+  if (req === act) return true;
+
+  // Allow family aliases (opus/sonnet/haiku) to match concrete dated models.
+  const reqFamily = claudeModelFamily(req);
+  const actFamily = claudeModelFamily(act);
+  if (reqFamily !== 'unknown' && actFamily !== 'unknown' && reqFamily === actFamily) {
+    return true;
+  }
+
+  return false;
+}
+
+function prependToPath(currentPath: string | undefined, prefix: string): string {
+  if (!currentPath || currentPath.trim().length === 0) return prefix;
+  const parts = currentPath.split(path.delimiter);
+  if (parts.includes(prefix)) return currentPath;
+  return `${prefix}${path.delimiter}${currentPath}`;
+}
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -360,7 +444,12 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+): Promise<{
+  newSessionId?: string;
+  lastAssistantUuid?: string;
+  model?: string;
+  closedDuringQuery: boolean;
+}> {
   const stream = new MessageStream();
   stream.push(prompt);
 
@@ -386,6 +475,7 @@ async function runQuery(
   setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
 
   let newSessionId: string | undefined;
+  let activeModel: string | undefined;
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
@@ -396,6 +486,12 @@ async function runQuery(
   if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
+  const systemPromptAppend = [
+    globalClaudeMd,
+    containerInput.isMain ? MAIN_DELEGATE_POLICY : undefined,
+  ]
+    .filter((x): x is string => !!x && x.trim().length > 0)
+    .join('\n\n');
 
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
@@ -413,6 +509,16 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  const anthropicBaseUrl = (sdkEnv.ANTHROPIC_BASE_URL || '').toLowerCase();
+  const configuredMainModel = getRequestedMainModel(sdkEnv);
+  const mainIsClaude = containerInput.isMain && !anthropicBaseUrl.includes('ollama');
+  if (mainIsClaude && !configuredMainModel) {
+    throw new Error(
+      `${MAIN_MODEL_ENV_KEY} is required for MAIN Claude runs`,
+    );
+  }
+  const mainModel = mainIsClaude ? configuredMainModel : undefined;
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -420,19 +526,11 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
+      systemPrompt: systemPromptAppend
+        ? { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend }
         : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*'
-      ],
+      model: mainModel,
+      allowedTools: [...getAllowedTools(containerInput.isMain)],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
@@ -493,7 +591,18 @@ async function runQuery(
 
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
+      activeModel = (message as { model?: string }).model?.trim() || activeModel;
       log(`Session initialized: ${newSessionId}`);
+      if (
+        containerInput.isMain &&
+        configuredMainModel &&
+        activeModel &&
+        !modelMatchesRequest(configuredMainModel, activeModel)
+      ) {
+        throw new Error(
+          `MAIN model mismatch: requested "${configuredMainModel}" but runtime initialized "${activeModel}"`,
+        );
+      }
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
@@ -508,14 +617,15 @@ async function runQuery(
       writeOutput({
         status: 'success',
         result: textResult || null,
-        newSessionId
+        newSessionId,
+        model: activeModel,
       });
     }
   }
 
   ipcPolling = false;
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  return { newSessionId, lastAssistantUuid, model: activeModel, closedDuringQuery };
 }
 
 async function main(): Promise<void> {
@@ -542,11 +652,13 @@ async function main(): Promise<void> {
   for (const [key, value] of Object.entries(containerInput.secrets || {})) {
     sdkEnv[key] = value;
   }
+  sdkEnv.PATH = prependToPath(sdkEnv.PATH, DOCLING_VENV_BIN);
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
   let sessionId = containerInput.sessionId;
+  let activeModel: string | undefined;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale _close sentinel from previous container runs
@@ -573,6 +685,9 @@ async function main(): Promise<void> {
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
+      if (queryResult.model) {
+        activeModel = queryResult.model;
+      }
       if (queryResult.lastAssistantUuid) {
         resumeAt = queryResult.lastAssistantUuid;
       }
@@ -586,7 +701,12 @@ async function main(): Promise<void> {
       }
 
       // Emit session update so host can track it
-      writeOutput({ status: 'success', result: null, newSessionId: sessionId });
+      writeOutput({
+        status: 'success',
+        result: null,
+        newSessionId: sessionId,
+        model: activeModel,
+      });
 
       log('Query ended, waiting for next IPC message...');
 
@@ -607,6 +727,7 @@ async function main(): Promise<void> {
       status: 'error',
       result: null,
       newSessionId: sessionId,
+      model: activeModel,
       error: errorMessage
     });
     process.exit(1);

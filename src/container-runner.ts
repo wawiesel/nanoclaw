@@ -51,6 +51,7 @@ export interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
   newSessionId?: string;
+  model?: string;
   error?: string;
 }
 
@@ -66,7 +67,7 @@ const ALLOWED_ENV_VARS = [
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_MODEL',
-  'NANOCLAW_MODEL',
+  'NANOCLAW_MAIN_MODEL',
   'OLLAMA_HOST',
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
@@ -182,13 +183,20 @@ function mapCertPathSecretsToContainer(
     mapped[key] = containerPath;
   }
 
-  // Some CLIs (including non-Node networking stacks) honor SSL_CERT_FILE but
-  // ignore NODE_EXTRA_CA_CERTS. Mirror values so delegate tools get both.
-  if (!mapped.SSL_CERT_FILE && mapped.NODE_EXTRA_CA_CERTS) {
-    mapped.SSL_CERT_FILE = mapped.NODE_EXTRA_CA_CERTS;
-  }
-  if (!mapped.NODE_EXTRA_CA_CERTS && mapped.SSL_CERT_FILE) {
-    mapped.NODE_EXTRA_CA_CERTS = mapped.SSL_CERT_FILE;
+  // Normalize CA bundle env so Node, Python/requests, curl, and git all see
+  // the same trust anchor even if only one variable is provided by the host.
+  const certBundle =
+    mapped.SSL_CERT_FILE ||
+    mapped.NODE_EXTRA_CA_CERTS ||
+    mapped.REQUESTS_CA_BUNDLE ||
+    mapped.CURL_CA_BUNDLE ||
+    mapped.GIT_SSL_CAINFO;
+  if (certBundle) {
+    if (!mapped.SSL_CERT_FILE) mapped.SSL_CERT_FILE = certBundle;
+    if (!mapped.NODE_EXTRA_CA_CERTS) mapped.NODE_EXTRA_CA_CERTS = certBundle;
+    if (!mapped.REQUESTS_CA_BUNDLE) mapped.REQUESTS_CA_BUNDLE = certBundle;
+    if (!mapped.CURL_CA_BUNDLE) mapped.CURL_CA_BUNDLE = certBundle;
+    if (!mapped.GIT_SSL_CAINFO) mapped.GIT_SSL_CAINFO = certBundle;
   }
 
   return mapped;

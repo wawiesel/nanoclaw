@@ -60,6 +60,8 @@ const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 const DOCLING_VENV_BIN = '/workspace/cache/venvs/docling_venv/bin';
 const MAIN_MODEL_ENV_KEY = 'NANOCLAW_MAIN_MODEL';
+const TOOL_PROGRESS_EMIT_MS = 15_000;
+const GENERAL_PROGRESS_DEDUPE_MS = 5_000;
 const MAIN_DELEGATE_POLICY = `Main thread policy:
 - You are an orchestrator who can also do short exploratory work directly.
 - You own final quality: verify all work, take responsibility for results, and do not outsource accountability.
@@ -133,6 +135,24 @@ function modelMatchesRequest(requested: string, actual: string): boolean {
   }
 
   return false;
+}
+
+function isOllamaAnthropicBaseUrl(baseUrl: string | undefined): boolean {
+  const trimmed = baseUrl?.trim();
+  if (!trimmed) return false;
+
+  const normalized = trimmed.toLowerCase();
+  if (normalized.includes('ollama')) return true;
+
+  try {
+    const parsed = new URL(trimmed);
+    const port =
+      parsed.port ||
+      (parsed.protocol === 'https:' ? '443' : parsed.protocol === 'http:' ? '80' : '');
+    return port === '11434';
+  } catch {
+    return false;
+  }
 }
 
 function prependToPath(currentPath: string | undefined, prefix: string): string {
@@ -479,6 +499,29 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  const lastToolProgressAt = new Map<string, number>();
+  let lastProgressText = '';
+  let lastProgressAt = 0;
+
+  const emitProgress = (text: string): void => {
+    const normalized = text.replace(/\r/g, '').replace(/\s+/g, ' ').trim();
+    if (!normalized) return;
+    const now = Date.now();
+    if (
+      normalized === lastProgressText &&
+      now - lastProgressAt < GENERAL_PROGRESS_DEDUPE_MS
+    ) {
+      return;
+    }
+    lastProgressText = normalized;
+    lastProgressAt = now;
+    writeOutput({
+      status: 'success',
+      result: normalized,
+      newSessionId,
+      model: activeModel,
+    });
+  };
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -509,9 +552,10 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
-  const anthropicBaseUrl = (sdkEnv.ANTHROPIC_BASE_URL || '').toLowerCase();
+  const anthropicBaseUrl = sdkEnv.ANTHROPIC_BASE_URL;
   const configuredMainModel = getRequestedMainModel(sdkEnv);
-  const mainIsClaude = containerInput.isMain && !anthropicBaseUrl.includes('ollama');
+  const mainIsClaude =
+    containerInput.isMain && !isOllamaAnthropicBaseUrl(anthropicBaseUrl);
   if (mainIsClaude && !configuredMainModel) {
     throw new Error(
       `${MAIN_MODEL_ENV_KEY} is required for MAIN Claude runs`,
@@ -608,6 +652,47 @@ async function runQuery(
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
       const tn = message as { task_id: string; status: string; summary: string };
       log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
+      const summary = tn.summary?.trim();
+      emitProgress(
+        summary
+          ? `task ${tn.status}: ${summary}`
+          : `task ${tn.task_id} ${tn.status}`,
+      );
+    }
+
+    if (message.type === 'system' && message.subtype === 'status') {
+      const statusText = (message as { status?: string | null }).status?.trim();
+      if (statusText) {
+        emitProgress(`status: ${statusText}`);
+      }
+    }
+
+    if (message.type === 'tool_progress') {
+      const progress = message as {
+        tool_use_id: string;
+        tool_name: string;
+        elapsed_time_seconds: number;
+      };
+      const toolUseId = progress.tool_use_id?.trim() || '';
+      const now = Date.now();
+      const lastEmittedAt = toolUseId ? (lastToolProgressAt.get(toolUseId) || 0) : 0;
+      if (!toolUseId || now - lastEmittedAt >= TOOL_PROGRESS_EMIT_MS) {
+        if (toolUseId) lastToolProgressAt.set(toolUseId, now);
+        const elapsedSeconds = Math.max(
+          1,
+          Math.floor(progress.elapsed_time_seconds || 0),
+        );
+        emitProgress(
+          `tool ${progress.tool_name} running (${elapsedSeconds}s)`,
+        );
+      }
+    }
+
+    if (message.type === 'tool_use_summary') {
+      const summary = (message as { summary?: string }).summary?.trim();
+      if (summary) {
+        emitProgress(summary);
+      }
     }
 
     if (message.type === 'result') {

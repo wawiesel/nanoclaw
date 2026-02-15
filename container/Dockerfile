@@ -30,7 +30,7 @@ ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Install global CLIs used by delegates/runners
-RUN npm install -g agent-browser @anthropic-ai/claude-code @google/gemini-cli
+RUN npm install -g agent-browser @anthropic-ai/claude-code @google/gemini-cli @openai/codex
 
 # Create app directory
 WORKDIR /app

@@ -122,13 +122,13 @@ Skills we'd love to see:
 Set this in your project `.env` to force MAIN to request an exact Claude model version:
 
 ```bash
-NANOCLAW_MAIN_MODEL=claude-sonnet-4-5-20250929
+ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
 ```
 
 Notes:
 - This is the only supported way to configure MAIN model selection.
-- `NANOCLAW_MAIN_MODEL` is required for MAIN Claude runs.
-- If you set `NANOCLAW_MAIN_MODEL` and Claude initializes a different model, NanoClaw now returns a clear mismatch error instead of silently continuing.
+- `ANTHROPIC_MODEL` is required for MAIN Claude runs.
+- If you set `ANTHROPIC_MODEL` and Claude initializes a different model, NanoClaw now returns a clear mismatch error instead of silently continuing.
 
 ## Architecture
 

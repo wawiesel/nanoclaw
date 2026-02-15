@@ -24,6 +24,7 @@ const DEFAULT_DELEGATE_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_DELEGATE_TIMEOUT_MS = 60 * 60 * 1000;
 const DELEGATE_CWD_ROOTS = ['/workspace/group', '/workspace/extra'];
 const DELEGATE_CACHE_ROOT = '/workspace/cache';
+const DOCLING_VENV_BIN = '/workspace/cache/venvs/docling_venv/bin';
 const HOST_CERT_FALLBACK = '/workspace/host-certs/node_extra_ca_certs-corporate-certs.pem';
 type DelegateEnv = Record<string, string | undefined>;
 
@@ -132,7 +133,7 @@ function isIgnorableDelegateStderr(line: string): boolean {
   return (
     s.includes('node_tls_reject_unauthorized') &&
     s.includes('makes tls connections and https requests insecure')
-  );
+  ) || s.includes('codex_core::rollout::list: state db missing rollout path for thread');
 }
 
 function formatDelegateSender(
@@ -153,6 +154,13 @@ function firstSet(...values: Array<string | undefined>): string | undefined {
   return undefined;
 }
 
+function prependToPath(currentPath: string | undefined, prefix: string): string {
+  if (!currentPath || currentPath.trim().length === 0) return prefix;
+  const parts = currentPath.split(path.delimiter);
+  if (parts.includes(prefix)) return currentPath;
+  return `${prefix}${path.delimiter}${currentPath}`;
+}
+
 function buildDelegateEnv(): DelegateEnv {
   const delegateEnv: DelegateEnv = {
     ...process.env,
@@ -166,6 +174,7 @@ function buildDelegateEnv(): DelegateEnv {
       process.env.VIRTUALENV_OVERRIDE_APP_DATA ||
       `${DELEGATE_CACHE_ROOT}/virtualenv`,
   };
+  delegateEnv.PATH = prependToPath(delegateEnv.PATH, DOCLING_VENV_BIN);
 
   if (fs.existsSync(HOST_CERT_FALLBACK)) {
     if (!delegateEnv.NODE_EXTRA_CA_CERTS) {
@@ -174,6 +183,21 @@ function buildDelegateEnv(): DelegateEnv {
     if (!delegateEnv.SSL_CERT_FILE) {
       delegateEnv.SSL_CERT_FILE = HOST_CERT_FALLBACK;
     }
+  }
+
+  const certBundle = firstSet(
+    delegateEnv.REQUESTS_CA_BUNDLE,
+    delegateEnv.CURL_CA_BUNDLE,
+    delegateEnv.GIT_SSL_CAINFO,
+    delegateEnv.SSL_CERT_FILE,
+    delegateEnv.NODE_EXTRA_CA_CERTS,
+  );
+  if (certBundle) {
+    if (!delegateEnv.SSL_CERT_FILE) delegateEnv.SSL_CERT_FILE = certBundle;
+    if (!delegateEnv.NODE_EXTRA_CA_CERTS) delegateEnv.NODE_EXTRA_CA_CERTS = certBundle;
+    if (!delegateEnv.REQUESTS_CA_BUNDLE) delegateEnv.REQUESTS_CA_BUNDLE = certBundle;
+    if (!delegateEnv.CURL_CA_BUNDLE) delegateEnv.CURL_CA_BUNDLE = certBundle;
+    if (!delegateEnv.GIT_SSL_CAINFO) delegateEnv.GIT_SSL_CAINFO = certBundle;
   }
 
   fs.mkdirSync(DELEGATE_CACHE_ROOT, { recursive: true });

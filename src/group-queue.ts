@@ -157,6 +157,32 @@ export class GroupQueue {
     }
   }
 
+  /**
+   * Read-only status snapshot for a group queue entry.
+   */
+  getGroupStatus(groupJid: string): {
+    active: boolean;
+    pendingMessages: boolean;
+    pendingTasks: number;
+    retryCount: number;
+    hasProcess: boolean;
+    containerName: string | null;
+    groupFolder: string | null;
+    waitingForSlot: boolean;
+  } {
+    const state = this.getGroup(groupJid);
+    return {
+      active: state.active,
+      pendingMessages: state.pendingMessages,
+      pendingTasks: state.pendingTasks.length,
+      retryCount: state.retryCount,
+      hasProcess: !!state.process && !state.process.killed,
+      containerName: state.containerName,
+      groupFolder: state.groupFolder,
+      waitingForSlot: this.waitingGroups.includes(groupJid),
+    };
+  }
+
   private async runForGroup(
     groupJid: string,
     reason: 'messages' | 'drain',

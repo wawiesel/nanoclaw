@@ -31,6 +31,7 @@ import {
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  deleteSession,
   getMessagesSince,
   getNewMessages,
   getRouterState,
@@ -56,51 +57,235 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+const QUEUED_ACK_COOLDOWN_MS = 30_000;
+const lastQueuedAckAt: Record<string, number> = {};
+const STATUS_REQUEST_PATTERN = /\b(progress|status|update|report)\b/i;
+const PROJECT_ENV_PATH = path.join(process.cwd(), '.env');
+
+function firstSet(...values: Array<string | undefined>): string | undefined {
+  for (const v of values) {
+    const s = v?.trim();
+    if (s) return s;
+  }
+  return undefined;
+}
+
+function parseEnvLine(line: string): [string, string] | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith('#')) return null;
+  const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+  if (!match) return null;
+  const key = match[1];
+  let value = match[2];
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1);
+  }
+  return [key, value];
+}
+
+function loadProjectEnv(): Record<string, string> {
+  const values: Record<string, string> = {};
+  if (!fs.existsSync(PROJECT_ENV_PATH)) return values;
+
+  try {
+    const envContent = fs.readFileSync(PROJECT_ENV_PATH, 'utf-8');
+    for (const line of envContent.split('\n')) {
+      const parsed = parseEnvLine(line);
+      if (!parsed) continue;
+      const [key, value] = parsed;
+      values[key] = value;
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to read project .env');
+  }
+
+  return values;
+}
+
+const PROJECT_ENV = loadProjectEnv();
+
+function getConfiguredEnv(key: string): string | undefined {
+  return firstSet(process.env[key], PROJECT_ENV[key]);
+}
+
+function resolveConfiguredMainModel(): string | undefined {
+  return getConfiguredEnv('NANOCLAW_MAIN_MODEL')?.trim() || undefined;
+}
+
+function parseNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function getClaudeModelFromStatsCache(): string | undefined {
+  const statsPath = path.join(
+    DATA_DIR,
+    'sessions',
+    MAIN_GROUP_FOLDER,
+    '.claude',
+    'stats-cache.json',
+  );
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(statsPath, 'utf-8'));
+  } catch {
+    return undefined;
+  }
+
+  if (!parsed || typeof parsed !== 'object') return undefined;
+
+  // Prefer modelUsage since it summarizes overall token usage by model.
+  const modelUsage = (parsed as { modelUsage?: unknown }).modelUsage;
+  if (modelUsage && typeof modelUsage === 'object') {
+    let bestModel: string | undefined;
+    let bestScore = -1;
+    for (const [model, usage] of Object.entries(modelUsage)) {
+      if (!model.trim() || !usage || typeof usage !== 'object') continue;
+      const metrics = usage as Record<string, unknown>;
+      const score =
+        parseNumber(metrics.inputTokens) +
+        parseNumber(metrics.outputTokens) +
+        parseNumber(metrics.cacheReadInputTokens) +
+        parseNumber(metrics.cacheCreationInputTokens);
+      if (score > bestScore) {
+        bestScore = score;
+        bestModel = model.trim();
+      }
+    }
+    if (bestModel) return bestModel;
+  }
+
+  // Fallback: inspect most recent daily tokens by model.
+  const dailyModelTokens = (parsed as { dailyModelTokens?: unknown }).dailyModelTokens;
+  if (Array.isArray(dailyModelTokens)) {
+    for (let i = dailyModelTokens.length - 1; i >= 0; i -= 1) {
+      const dayEntry = dailyModelTokens[i];
+      if (!dayEntry || typeof dayEntry !== 'object') continue;
+      const tokensByModel = (dayEntry as { tokensByModel?: unknown }).tokensByModel;
+      if (!tokensByModel || typeof tokensByModel !== 'object') continue;
+
+      let bestModel: string | undefined;
+      let bestTokens = -1;
+      for (const [model, tokens] of Object.entries(tokensByModel)) {
+        const tokenCount = parseNumber(tokens);
+        if (model.trim() && tokenCount > bestTokens) {
+          bestTokens = tokenCount;
+          bestModel = model.trim();
+        }
+      }
+      if (bestModel) return bestModel;
+    }
+  }
+
+  return undefined;
+}
+
 function resolveMainProvider(): 'claude' | 'ollama' {
-  const anthropicBaseUrl = (process.env.ANTHROPIC_BASE_URL || '').toLowerCase();
+  const anthropicBaseUrl =
+    (getConfiguredEnv('ANTHROPIC_BASE_URL') || '').toLowerCase();
   if (anthropicBaseUrl.includes('ollama')) {
     return 'ollama';
   }
   return 'claude';
 }
-function resolveMainLlm(): string {
-  const firstSet = (
-    ...values: Array<string | undefined>
-  ): string | undefined => {
-    for (const v of values) {
-      const s = v?.trim();
-      if (s) return s;
-    }
-    return undefined;
-  };
 
-  // Explicit app-level override first.
-  const directModel = firstSet(
-    process.env.NANOCLAW_MODEL,
-    process.env.ANTHROPIC_MODEL,
-  );
+function isGenericClaudeModel(model: string): boolean {
+  const normalized = model.trim().toLowerCase();
+  if (!normalized) return true;
+
+  if (
+    normalized === 'default' ||
+    normalized === 'opus' ||
+    normalized === 'sonnet' ||
+    normalized === 'haiku' ||
+    normalized === 'claude-opus' ||
+    normalized === 'claude-sonnet' ||
+    normalized === 'claude-haiku'
+  ) {
+    return true;
+  }
+
+  // Treat family aliases like claude-opus, claude-opus-latest as non-specific.
+  // Any model string containing digits is considered specific (e.g. claude-opus-4-6).
+  if (/^(claude-)?(opus|sonnet|haiku)(-[a-z._-]+)?$/i.test(normalized) && !/\d/.test(normalized)) {
+    return true;
+  }
+
+  return false;
+}
+
+function normalizeMainLlm(model: string | undefined): string | undefined {
+  const trimmed = model?.trim();
+  if (!trimmed) return undefined;
+
+  if (resolveMainProvider() !== 'claude') {
+    return trimmed;
+  }
+
+  if (!isGenericClaudeModel(trimmed)) {
+    return trimmed;
+  }
+
+  // Try to upgrade generic aliases to a concrete dated model if available.
+  const fromStats = getClaudeModelFromStatsCache()?.trim();
+  if (fromStats && !isGenericClaudeModel(fromStats)) {
+    return fromStats;
+  }
+
+  return undefined;
+}
+function resolveMainLlm(): string {
+  // Explicit MAIN model override first.
+  const directModel = resolveConfiguredMainModel();
   if (directModel) return directModel;
 
   // If Anthropic endpoint is redirected to Ollama, prefer Ollama model env.
-  const anthropicBaseUrl = (process.env.ANTHROPIC_BASE_URL || '').toLowerCase();
+  const anthropicBaseUrl =
+    (getConfiguredEnv('ANTHROPIC_BASE_URL') || '').toLowerCase();
   if (anthropicBaseUrl.includes('ollama')) {
-    const ollamaModel = firstSet(process.env.OLLAMA_MODEL, process.env.MODEL);
+    const ollamaModel = normalizeMainLlm(
+      firstSet(getConfiguredEnv('OLLAMA_MODEL'), getConfiguredEnv('MODEL')),
+    );
     if (ollamaModel) return ollamaModel;
   }
 
+  // For native Claude sessions, wait for runtime init.model so label is exact.
+  if (resolveMainProvider() === 'claude') {
+    const statsModel = normalizeMainLlm(getClaudeModelFromStatsCache());
+    if (statsModel) return statsModel;
+    return 'unknown-model';
+  }
+
   // Generic fallback for other redirected providers.
-  return firstSet(
-    process.env.OLLAMA_MODEL,
-    process.env.OPENAI_MODEL,
-    process.env.MODEL,
-    process.env.GEMINI_MODEL,
-    process.env.CODEX_MODEL,
-    'unknown-model',
-  )!;
+  return (
+    normalizeMainLlm(
+      firstSet(
+        getConfiguredEnv('OLLAMA_MODEL'),
+        getConfiguredEnv('OPENAI_MODEL'),
+        getConfiguredEnv('MODEL'),
+        getConfiguredEnv('GEMINI_MODEL'),
+        getConfiguredEnv('CODEX_MODEL'),
+      ),
+    ) || 'unknown-model'
+  );
 }
-const MAIN_LLM = resolveMainLlm();
 const MAIN_PROVIDER = resolveMainProvider();
-const MAIN_SENDER = `MAIN(${MAIN_PROVIDER},${MAIN_LLM})`;
+let mainLlm = resolveMainLlm();
+
+function updateMainLlm(model?: string): void {
+  const normalized = normalizeMainLlm(model);
+  if (!normalized || normalized === mainLlm) return;
+  mainLlm = normalized;
+  setRouterState('main_model', mainLlm);
+  logger.info({ mainModel: mainLlm }, 'Updated MAIN model label');
+}
+
+function mainSender(): string {
+  return `MAIN(${MAIN_PROVIDER},${mainLlm})`;
+}
 
 let channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -116,8 +301,32 @@ function loadState(): void {
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
+  const configuredMainModel = resolveConfiguredMainModel();
+  const storedMainModel = normalizeMainLlm(getRouterState('main_model'));
+  if (configuredMainModel) {
+    const pinnedChanged =
+      storedMainModel && configuredMainModel !== storedMainModel;
+    mainLlm = configuredMainModel;
+    setRouterState('main_model', mainLlm);
+
+    // If model pin changed, drop the main session so Claude initializes fresh
+    // on the requested model instead of resuming a prior-model session.
+    if (pinnedChanged && sessions[MAIN_GROUP_FOLDER]) {
+      deleteSession(MAIN_GROUP_FOLDER);
+      delete sessions[MAIN_GROUP_FOLDER];
+      logger.info(
+        {
+          fromModel: storedMainModel,
+          toModel: configuredMainModel,
+        },
+        'Pinned MAIN model changed; cleared main session',
+      );
+    }
+  } else if (storedMainModel) {
+    mainLlm = storedMainModel;
+  }
   logger.info(
-    { groupCount: Object.keys(registeredGroups).length },
+    { groupCount: Object.keys(registeredGroups).length, mainModel: mainLlm },
     'State loaded',
   );
 }
@@ -128,6 +337,7 @@ function saveState(): void {
     'last_agent_timestamp',
     JSON.stringify(lastAgentTimestamp),
   );
+  setRouterState('main_model', mainLlm);
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -270,6 +480,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const runResult = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
+    if (group.folder === MAIN_GROUP_FOLDER && result.model) {
+      updateMainLlm(result.model);
+    }
     if (result.result) {
       const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
@@ -278,11 +491,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (text) {
         const ch = findChannel(channels, chatJid);
         if (ch) {
-          const prefixed = `${MAIN_SENDER}: ${text}`;
+          const prefixed = `${mainSender()}: ${text}`;
           await ch.sendMessage(chatJid, prefixed);
         }
         outputSentToUser = true;
-        agentResponses.push(`${MAIN_SENDER}: ${text}`);
+        agentResponses.push(`${mainSender()}: ${text}`);
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -304,7 +517,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     if (!outputSentToUser && channel) {
       const errorReply =
-        `${MAIN_SENDER}: I hit an error while processing that request: ${compactError}`;
+        `${mainSender()}: I hit an error while processing that request: ${compactError}`;
       try {
         await channel.sendMessage(chatJid, errorReply);
         outputSentToUser = true;
@@ -479,11 +692,58 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
+          const statusMessages = messagesToSend.filter((m) =>
+            STATUS_REQUEST_PATTERN.test(m.content.trim()),
+          );
+          const nonStatusMessages = messagesToSend.filter(
+            (m) => !STATUS_REQUEST_PATTERN.test(m.content.trim()),
+          );
+          const hasStatusRequest = statusMessages.length > 0;
+
+          if (hasStatusRequest) {
+            const now = Date.now();
+            if (
+              !lastQueuedAckAt[chatJid] ||
+              now - lastQueuedAckAt[chatJid] >= QUEUED_ACK_COOLDOWN_MS
+            ) {
+              const snapshot = queue.getGroupStatus(chatJid);
+              const statusLine = snapshot.active
+                ? `observed status: active run in progress${snapshot.pendingTasks > 0 ? ` (${snapshot.pendingTasks} queued task${snapshot.pendingTasks === 1 ? '' : 's'})` : ''}.`
+                : snapshot.pendingMessages || snapshot.pendingTasks > 0 || snapshot.waitingForSlot
+                  ? 'observed status: work is queued and waiting to run.'
+                  : 'observed status: no active run right now.';
+              const ch = findChannel(channels, chatJid);
+              if (ch) {
+                try {
+                  await ch.sendMessage(
+                    chatJid,
+                    `${mainSender()}: ${statusLine}`,
+                  );
+                  lastQueuedAckAt[chatJid] = now;
+                } catch (err) {
+                  logger.warn(
+                    { chatJid, err },
+                    'Failed to send observed status acknowledgement',
+                  );
+                }
+              }
+            }
+          }
+
+          // Status-only prompts are answered by observed state and should not
+          // be piped into active runs.
+          if (nonStatusMessages.length === 0) {
+            lastAgentTimestamp[chatJid] =
+              messagesToSend[messagesToSend.length - 1].timestamp;
+            saveState();
+            continue;
+          }
+
+          const formatted = formatMessages(nonStatusMessages);
 
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              { chatJid, count: nonStatusMessages.length },
               'Piped messages to active container',
             );
             lastAgentTimestamp[chatJid] =
@@ -495,6 +755,29 @@ async function startMessageLoop(): Promise<void> {
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
+            const now = Date.now();
+            if (
+              !lastQueuedAckAt[chatJid] ||
+              now - lastQueuedAckAt[chatJid] >= QUEUED_ACK_COOLDOWN_MS
+            ) {
+              const ch = findChannel(channels, chatJid);
+              if (ch) {
+                try {
+                  await ch.sendMessage(
+                    chatJid,
+                    hasStatusRequest
+                      ? `${mainSender()}: status request received. I am starting the run now and will send a concrete update shortly.`
+                      : `${mainSender()}: working on it now...`,
+                  );
+                  lastQueuedAckAt[chatJid] = now;
+                } catch (err) {
+                  logger.warn(
+                    { chatJid, err },
+                    'Failed to send queued acknowledgement',
+                  );
+                }
+              }
+            }
           }
         }
       }
@@ -730,7 +1013,7 @@ async function main(): Promise<void> {
       const ch = findChannel(channels, jid);
       if (!ch) return;
       const text = stripInternalTags(rawText);
-      if (text) await ch.sendMessage(jid, `${MAIN_SENDER}: ${text}`);
+      if (text) await ch.sendMessage(jid, `${mainSender()}: ${text}`);
     },
   });
   startIpcWatcher({

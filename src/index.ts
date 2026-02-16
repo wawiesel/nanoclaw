@@ -4,12 +4,18 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  ASSISTANT_REACTION,
+  ASSISTANT_ROLE,
+  ASSISTANT_TRIGGER,
   CONTAINER_IMAGE,
   CONTAINER_RUNTIME,
   DATA_DIR,
   GROUPS_DIR,
   HEAP_LIMIT_MB,
   IDLE_TIMEOUT,
+  LOCAL_CHANNEL_ENABLED,
+  LOCAL_CHAT_JID,
+  LOCAL_MIRROR_MATRIX_JID,
   MAIN_GROUP_FOLDER,
   MATRIX_ACCESS_TOKEN,
   MATRIX_HOMESERVER,
@@ -20,6 +26,7 @@ import {
   POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
+import { LocalCliChannel } from './channels/local-cli.js';
 import { MatrixChannel } from './channels/matrix.js';
 import {
   ContainerOutput,
@@ -62,6 +69,8 @@ const QUEUED_ACK_COOLDOWN_MS = 30_000;
 const lastQueuedAckAt: Record<string, number> = {};
 const ACTIVE_PIPE_ACK_COOLDOWN_MS = 5_000;
 const lastActivePipeAckAt: Record<string, number> = {};
+const PROGRESS_CHAT_COOLDOWN_MS = 10_000;
+const lastProgressChatAt: Record<string, number> = {};
 const STATUS_REQUEST_PATTERN = /\b(progress|status|report)\b/i;
 const ACTIVITY_STATUS_PATTERN =
   /\b(what are you doing|what are you working on|what's happening|whats happening|where are you at|how's it going|hows it going)\b/i;
@@ -311,7 +320,8 @@ function updateMainLlm(model?: string): void {
 }
 
 function mainSender(): string {
-  return `MAIN(${MAIN_PROVIDER},${mainLlm})`;
+  const providerName = MAIN_PROVIDER.charAt(0).toUpperCase() + MAIN_PROVIDER.slice(1);
+  return `<font color="#888888">${ASSISTANT_ROLE} <em>(${providerName}/${mainLlm})</em></font>`;
 }
 
 function defaultSenderForGroup(sourceGroup: string): string {
@@ -333,7 +343,7 @@ function getMainChatJid(): string | undefined {
 }
 
 function formatMainMessage(body: string): string {
-  return `${mainSender()}:\n\n${body.trim()}`;
+  return body.trim();
 }
 
 function chatActivityStateKey(chatJid: string): string {
@@ -617,7 +627,8 @@ function hasRuntimeActiveGroupRun(chatJid: string): boolean {
   if (!group) return false;
 
   const safeFolder = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-  const prefix = `nanoclaw-${safeFolder}-`;
+  const runtimeBotTag = (ASSISTANT_NAME || 'bot').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  const prefix = `nanoclaw-${runtimeBotTag}-${safeFolder}-`;
 
   if (CONTAINER_RUNTIME === 'podman') {
     try {
@@ -754,6 +765,69 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   );
 }
 
+function deriveFolderFromChatJid(chatJid: string): string {
+  const base = chatJid
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const short = base.slice(0, 48) || 'chat';
+  return `chat-${short}`;
+}
+
+function ensureGroupForIncomingChat(
+  chatJid: string,
+  chatName?: string,
+): void {
+  if (registeredGroups[chatJid]) {
+    if (
+      LOCAL_CHANNEL_ENABLED &&
+      chatJid === LOCAL_CHAT_JID &&
+      registeredGroups[chatJid].requiresTrigger !== false
+    ) {
+      const updated: RegisteredGroup = {
+        ...registeredGroups[chatJid],
+        requiresTrigger: false,
+      };
+      registerGroup(chatJid, updated);
+      logger.info(
+        { chatJid },
+        'Terminal local-chat group set to direct mode (requiresTrigger=false)',
+      );
+    }
+    return;
+  }
+
+  const hasMain = Object.values(registeredGroups).some(
+    (g) => g.folder === MAIN_GROUP_FOLDER,
+  );
+
+  const name = (chatName || chatJid).trim() || chatJid;
+  const addedAt = new Date().toISOString();
+  const defaultTrigger = `@${ASSISTANT_TRIGGER}`;
+  const localDirectMode = LOCAL_CHANNEL_ENABLED && chatJid === LOCAL_CHAT_JID;
+  const group: RegisteredGroup = hasMain
+    ? {
+        name,
+        folder: deriveFolderFromChatJid(chatJid),
+        trigger: defaultTrigger,
+        added_at: addedAt,
+        requiresTrigger: localDirectMode ? false : true,
+      }
+    : {
+        name,
+        folder: MAIN_GROUP_FOLDER,
+        trigger: defaultTrigger,
+        added_at: addedAt,
+        requiresTrigger: false,
+      };
+
+  registerGroup(chatJid, group);
+  logger.info(
+    { chatJid, folder: group.folder, requiresTrigger: group.requiresTrigger },
+    'Auto-registered group for incoming chat',
+  );
+}
+
 /**
  * Get available groups list for the agent.
  * Returns groups ordered by most recent activity.
@@ -763,7 +837,7 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
   const registeredJids = new Set(Object.keys(registeredGroups));
 
   return chats
-    .filter((c) => c.jid !== '__group_sync__' && c.jid.startsWith('matrix:'))
+    .filter((c) => c.jid !== '__group_sync__' && (c.jid.startsWith('matrix:') || c.jid.endsWith('@g.us')))
     .map((c) => ({
       jid: c.jid,
       name: c.name,
@@ -881,6 +955,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const channel = findChannel(channels, chatJid);
   if (channel?.setTyping) await channel.setTyping(chatJid, true);
+
+  // React to the last message to acknowledge we're working on it
+  if (ASSISTANT_REACTION && channel?.sendReaction) {
+    const lastMsg = missedMessages[missedMessages.length - 1];
+    if (lastMsg?.id) {
+      try {
+        await channel.sendReaction(chatJid, lastMsg.id, ASSISTANT_REACTION);
+      } catch (err) {
+        logger.warn({ err, chatJid }, 'Failed to send working reaction');
+      }
+    }
+  }
+
   let hadError = false;
   let outputSentToUser = false;
   const agentResponses: string[] = [];
@@ -918,15 +1005,34 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        markProgress(chatJid, text);
-        lastResponseBody = text;
-        lastRunOutputAt = Date.now();
-        const ch = findChannel(channels, chatJid);
-        if (ch) {
-          await ch.sendMessage(chatJid, formatMainMessage(text));
+        if (result.isProgress) {
+          markProgress(chatJid, text);
+          // Forward progress to chat with rate limiting
+          const now = Date.now();
+          if (!lastProgressChatAt[chatJid] || now - lastProgressChatAt[chatJid] >= PROGRESS_CHAT_COOLDOWN_MS) {
+            lastProgressChatAt[chatJid] = now;
+            const ch = findChannel(channels, chatJid);
+            if (ch) {
+              const formatted = text.includes('<details>')
+                ? text
+                : `<small><font color="#888888"><em>${text}</em></font></small>`;
+              void ch.sendMessage(chatJid, formatted).catch((err) => {
+                logger.warn({ chatJid, err }, 'Failed to send progress to chat');
+              });
+            }
+          }
+        } else {
+          // Final result: deliver to chat
+          markProgress(chatJid, text);
+          lastResponseBody = text;
+          lastRunOutputAt = Date.now();
+          const ch = findChannel(channels, chatJid);
+          if (ch) {
+            await ch.sendMessage(chatJid, formatMainMessage(text));
+          }
+          outputSentToUser = true;
+          agentResponses.push(formatMainMessage(text));
         }
-        outputSentToUser = true;
-        agentResponses.push(formatMainMessage(text));
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -1085,7 +1191,7 @@ async function startMessageLoop(): Promise<void> {
   }
   messageLoopRunning = true;
 
-  logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
+  logger.info(`NanoClaw running (trigger: @${ASSISTANT_TRIGGER})`);
 
   while (true) {
     try {
@@ -1197,11 +1303,13 @@ async function startMessageLoop(): Promise<void> {
               now - lastActivePipeAckAt[chatJid] >= ACTIVE_PIPE_ACK_COOLDOWN_MS
             ) {
               const ch = findChannel(channels, chatJid);
-              const objective = compactMessage(
-                nonProbeMessages[nonProbeMessages.length - 1]?.content || '',
-                120,
-              );
-              if (ch) {
+              const lastMessage = nonProbeMessages[nonProbeMessages.length - 1];
+              if (ASSISTANT_REACTION && ch?.sendReaction && lastMessage?.id) {
+                void ch.sendReaction(chatJid, lastMessage.id, ASSISTANT_REACTION).catch((err) => {
+                  logger.warn({ chatJid, err }, 'Failed to send active-run reaction acknowledgement');
+                });
+              } else if (ch) {
+                const objective = compactMessage(lastMessage?.content || '', 120);
                 void ch.sendMessage(
                   chatJid,
                   formatMainMessage(
@@ -1230,16 +1338,21 @@ async function startMessageLoop(): Promise<void> {
               const ch = findChannel(channels, chatJid);
               if (ch) {
                 try {
-                  const objective = compactMessage(
-                    nonProbeMessages[nonProbeMessages.length - 1]?.content || '',
-                    160,
-                  );
-                  await ch.sendMessage(
-                    chatJid,
-                    formatMainMessage(
-                      `queued and starting run now.${objective ? ` objective: ${objective}.` : ''}`,
-                    ),
-                  );
+                  const lastMessage = nonProbeMessages[nonProbeMessages.length - 1];
+                  if (ASSISTANT_REACTION && ch.sendReaction && lastMessage?.id) {
+                    await ch.sendReaction(chatJid, lastMessage.id, ASSISTANT_REACTION);
+                  } else {
+                    const objective = compactMessage(
+                      lastMessage?.content || '',
+                      160,
+                    );
+                    await ch.sendMessage(
+                      chatJid,
+                      formatMainMessage(
+                        `queued and starting run now.${objective ? ` objective: ${objective}.` : ''}`,
+                      ),
+                    );
+                  }
                   lastQueuedAckAt[chatJid] = now;
                 } catch (err) {
                   logger.warn(
@@ -1434,10 +1547,12 @@ function cleanupOrphanedPodmanContainers(): void {
       if (Array.isArray(c.Names)) return c.Names;
       return c.Names ? [c.Names] : [];
     });
-    const orphans = names.filter((n) => n.startsWith('nanoclaw-'));
+    const botTag = (ASSISTANT_NAME || 'bot').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const ownPrefix = `nanoclaw-${botTag}-`;
+    const orphans = names.filter((n) => n.startsWith(ownPrefix));
     for (const name of orphans) {
       try {
-        execSync(`podman stop ${name}`, { stdio: 'pipe' });
+        execSync(`podman stop -t 1 ${name}`, { stdio: 'pipe' });
       } catch {
         // Best-effort cleanup
       }
@@ -1526,8 +1641,10 @@ async function ensureContainerSystemRunning(): Promise<void> {
       encoding: 'utf-8',
     });
     const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
+    const acBotTag = (ASSISTANT_NAME || 'bot').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const acOwnPrefix = `nanoclaw-${acBotTag}-`;
     const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
+      .filter((c) => c.status === 'running' && c.configuration.id.startsWith(acOwnPrefix))
       .map((c) => c.configuration.id);
     for (const name of orphans) {
       try {
@@ -1540,6 +1657,40 @@ async function ensureContainerSystemRunning(): Promise<void> {
   } catch (err) {
     logger.warn({ err }, 'Failed to clean up orphaned containers');
   }
+}
+
+/**
+ * After any restart, inject a synthetic message into the main chat
+ * so the agent re-enters the conversation instead of sitting idle.
+ * Only injects if there are real pending messages to resume from.
+ */
+function injectResumeMessage(): void {
+  const mainJid = Object.entries(registeredGroups).find(
+    ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+  )?.[0];
+  if (!mainJid) return;
+
+  const pending = getMessagesSince(
+    mainJid,
+    lastAgentTimestamp[mainJid] || '',
+    ASSISTANT_NAME,
+  );
+  if (pending.length === 0) {
+    logger.info({ mainJid }, 'No pending messages after restart — skipping resume injection');
+    return;
+  }
+
+  storeMessage({
+    id: `resume-${Date.now()}`,
+    chat_jid: mainJid,
+    chat_name: registeredGroups[mainJid].name,
+    sender: 'system',
+    sender_name: 'System',
+    content: 'You just restarted. Check the conversation above for context and resume where you left off.',
+    timestamp: new Date().toISOString(),
+  });
+  queue.enqueueMessageCheck(mainJid);
+  logger.info({ mainJid, pendingCount: pending.length }, 'Injected resume message after restart');
 }
 
 async function main(): Promise<void> {
@@ -1565,26 +1716,58 @@ async function main(): Promise<void> {
     (MATRIX_ACCESS_TOKEN || (MATRIX_USERNAME && MATRIX_PASSWORD))
   ) {
     matrix = new MatrixChannel({
-      onMessage: (_chatJid, msg) => storeMessage(msg),
-      onChatMetadata: (chatJid, timestamp, name) => storeChatMetadata(chatJid, timestamp, name),
+      onMessage: (_chatJid, msg) => {
+        ensureGroupForIncomingChat(msg.chat_jid, msg.chat_name);
+        storeMessage(msg);
+      },
+      onChatMetadata: (chatJid, timestamp, name) => {
+        ensureGroupForIncomingChat(chatJid, name);
+        storeChatMetadata(chatJid, timestamp, name);
+      },
       registeredGroups: () => registeredGroups,
     });
   }
 
+  let localCli: LocalCliChannel | null = null;
+  if (LOCAL_CHANNEL_ENABLED) {
+    localCli = new LocalCliChannel({
+      onMessage: (_chatJid, msg) => {
+        ensureGroupForIncomingChat(msg.chat_jid, msg.chat_name);
+        storeMessage(msg);
+      },
+      onChatMetadata: (chatJid, timestamp, name) =>
+        storeChatMetadata(chatJid, timestamp, name),
+      mirrorToMatrix: LOCAL_MIRROR_MATRIX_JID
+        ? async (text: string) => {
+            if (!matrix || !matrix.isConnected()) return;
+            await matrix.sendMessage(LOCAL_MIRROR_MATRIX_JID, text);
+          }
+        : undefined,
+    });
+  }
+
   // Build channels array (only include connected channels)
-  const allChannels: (Channel | null)[] = [matrix];
+  const allChannels: (Channel | null)[] = [localCli, matrix];
   const refreshConnectedChannels = () => {
     channels = allChannels.filter((ch): ch is Channel => ch != null && ch.isConnected());
   };
   refreshConnectedChannels();
 
+  // Connect local CLI first (doesn't need network)
+  if (localCli) {
+    try {
+      await localCli.connect();
+    } catch (err) {
+      logger.error({ err }, 'Local CLI channel connect failed');
+    }
+  }
+
   // Connect channels
   if (matrix) {
-    try {
-      await matrix.connect();
-    } catch (err) {
+    // Do not block local terminal startup on Matrix/network connectivity.
+    void matrix.connect().catch((err) => {
       logger.error({ err }, 'Initial Matrix connection failed; continuing in degraded mode');
-    }
+    });
     refreshConnectedChannels();
 
     let matrixReconnectInProgress = false;
@@ -1662,7 +1845,68 @@ async function main(): Promise<void> {
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+  injectResumeMessage();
   startMessageLoop();
+
+  // Periodic status snapshot for containers to read via check_health MCP tool
+  const STATUS_SNAPSHOT_INTERVAL = 30_000;
+  const writeStatusSnapshot = () => {
+    try {
+      const snapshot = {
+        timestamp: new Date().toISOString(),
+        bot: ASSISTANT_NAME,
+        role: ASSISTANT_ROLE,
+        model: mainLlm,
+        provider: MAIN_PROVIDER,
+        groups: Object.entries(registeredGroups).map(([jid, g]) => {
+          const queueStatus = queue.getGroupStatus(jid);
+          const activity = chatActivity[jid] || {};
+          return {
+            jid,
+            name: g.name,
+            folder: g.folder,
+            active: queueStatus.active,
+            hasProcess: queueStatus.hasProcess,
+            containerName: queueStatus.containerName,
+            pendingMessages: queueStatus.pendingMessages,
+            pendingTasks: queueStatus.pendingTasks,
+            currentObjective: activity.currentObjective,
+            lastProgress: activity.lastProgress,
+            lastProgressAt: activity.lastProgressAt,
+            lastError: activity.lastError,
+            lastErrorAt: activity.lastErrorAt,
+          };
+        }),
+      };
+
+      for (const [, g] of Object.entries(registeredGroups)) {
+        const ipcDir = path.join(DATA_DIR, 'ipc', g.folder);
+        if (!fs.existsSync(ipcDir)) continue;
+        const statusPath = path.join(ipcDir, 'status.json');
+        const tmpPath = `${statusPath}.tmp`;
+        fs.writeFileSync(tmpPath, JSON.stringify(snapshot, null, 2));
+        fs.renameSync(tmpPath, statusPath);
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to write status snapshot');
+    }
+  };
+  writeStatusSnapshot();
+  setInterval(writeStatusSnapshot, STATUS_SNAPSHOT_INTERVAL);
+
+  // Send boot announcement once main channel is available
+  const bootAnnounceTimer = setInterval(async () => {
+    const mainJid = getMainChatJid();
+    if (!mainJid) return;
+    const ch = findChannel(channels, mainJid);
+    if (!ch) return;
+    clearInterval(bootAnnounceTimer);
+    try {
+      await ch.sendMessage(mainJid, `online.\n\n${mainSender()}`);
+    } catch (err) {
+      logger.warn({ err }, 'Failed to send boot announcement');
+    }
+  }, 2000);
 
   setInterval(async () => {
     const mainChatJid = getMainChatJid();

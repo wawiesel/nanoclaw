@@ -8,6 +8,7 @@ import os from 'os';
 import path from 'path';
 
 import {
+  ASSISTANT_NAME,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_CPUS,
@@ -50,6 +51,7 @@ export interface ContainerInput {
 export interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
+  isProgress?: boolean;
   newSessionId?: string;
   model?: string;
   error?: string;
@@ -488,7 +490,8 @@ export async function runContainerAgent(
     secrets: redactSecrets(effectiveInput.secrets),
   };
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-  const containerName = `nanoclaw-${safeName}-${Date.now()}`;
+  const botTag = (ASSISTANT_NAME || 'bot').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  const containerName = `nanoclaw-${botTag}-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
 
   logger.debug(

@@ -2,6 +2,8 @@ import {
   MatrixClient,
   MatrixAuth,
   SimpleFsStorageProvider,
+  LogService,
+  LogLevel,
 } from 'matrix-bot-sdk';
 
 import {
@@ -316,6 +318,55 @@ function matrixErrCode(err: unknown): string | undefined {
   return undefined;
 }
 
+let matrixSdkLoggerConfigured = false;
+
+function isExpectedAccountDataMissing(args: unknown[]): boolean {
+  return args.some((arg) => {
+    if (!arg || typeof arg !== 'object') return false;
+    const record = arg as Record<string, unknown>;
+    const errcode =
+      typeof record.errcode === 'string'
+        ? record.errcode
+        : typeof (record.body as Record<string, unknown> | undefined)?.errcode ===
+            'string'
+          ? ((record.body as Record<string, unknown>).errcode as string)
+          : undefined;
+    const message =
+      typeof record.error === 'string'
+        ? record.error
+        : typeof (record.body as Record<string, unknown> | undefined)?.error ===
+            'string'
+          ? ((record.body as Record<string, unknown>).error as string)
+          : '';
+    return errcode === 'M_NOT_FOUND' && message === 'Account data not found';
+  });
+}
+
+function configureMatrixSdkLogger(): void {
+  if (matrixSdkLoggerConfigured) return;
+  matrixSdkLoggerConfigured = true;
+  LogService.setLevel(LogLevel.INFO);
+  LogService.setLogger({
+    info: (module, ...args) => logger.debug({ module, args }, 'matrix-sdk info'),
+    debug: (module, ...args) => logger.trace({ module, args }, 'matrix-sdk debug'),
+    trace: (module, ...args) => logger.trace({ module, args }, 'matrix-sdk trace'),
+    warn: (module, ...args) => {
+      if (isExpectedAccountDataMissing(args)) {
+        logger.debug('Matrix account-data not found (expected on fresh sessions)');
+        return;
+      }
+      logger.warn({ module, args }, 'matrix-sdk warn');
+    },
+    error: (module, ...args) => {
+      if (isExpectedAccountDataMissing(args)) {
+        logger.debug('Matrix account-data not found (expected on fresh sessions)');
+        return;
+      }
+      logger.warn({ module, args }, 'matrix-sdk error');
+    },
+  });
+}
+
 export class MatrixChannel implements Channel {
   name = 'matrix';
   prefixAssistantName = false; // Bot display name shows in Matrix
@@ -326,6 +377,7 @@ export class MatrixChannel implements Channel {
   private opts: MatrixChannelOpts;
 
   constructor(opts: MatrixChannelOpts) {
+    configureMatrixSdkLogger();
     this.opts = opts;
   }
 
@@ -679,6 +731,30 @@ export class MatrixChannel implements Channel {
         this.markDisconnected('Matrix auth failed while sending message', err);
       }
       logger.warn({ jid, err }, 'Failed to send Matrix message');
+    }
+  }
+
+  async sendReaction(jid: string, eventId: string, emoji: string): Promise<void> {
+    if (!this.client || !this._connected) return;
+    const roomId = toRoomId(jid);
+    try {
+      const content = {
+        'm.relates_to': {
+          rel_type: 'm.annotation',
+          event_id: eventId,
+          key: emoji,
+        },
+      };
+      await withTimeout(
+        this.client.sendEvent(roomId, 'm.reaction', content),
+        MATRIX_SEND_TIMEOUT_MS,
+        'sendReaction',
+      );
+    } catch (err) {
+      if (this.isAuthFailure(err)) {
+        this.markDisconnected('Matrix auth failed while sending reaction', err);
+      }
+      logger.warn({ jid, eventId, err }, 'Failed to send Matrix reaction');
     }
   }
 

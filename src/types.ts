@@ -44,6 +44,7 @@ export interface RegisteredGroup {
 export interface NewMessage {
   id: string;
   chat_jid: string;
+  chat_name?: string;
   sender: string;
   sender_name: string;
   content: string;
@@ -91,6 +92,8 @@ export interface Channel {
   sendImage?(jid: string, buffer: Buffer, filename: string, mimetype: string, caption?: string): Promise<void>;
   // Optional: send a generic file attachment. Buffer is the raw file data.
   sendFile?(jid: string, buffer: Buffer, filename: string, mimetype: string, caption?: string): Promise<void>;
+  // Optional: reaction to a message to acknowledge receipt
+  sendReaction?(jid: string, eventId: string, emoji: string): Promise<void>;
   // Whether to prefix outbound messages with the assistant name.
   // Telegram bots already display their name, so they return false.
   // WhatsApp returns true. Default true if not implemented.

@@ -32,6 +32,7 @@ interface ContainerInput {
 interface ContainerOutput {
   status: 'success' | 'error';
   result: string | null;
+  isProgress?: boolean;
   newSessionId?: string;
   model?: string;
   error?: string;
@@ -79,17 +80,17 @@ const SDK_PROCESS_ENV_KEYS = [
   'GIT_SSL_CAINFO',
   'NODE_TLS_REJECT_UNAUTHORIZED',
 ] as const;
-const MAIN_DELEGATE_POLICY = `Main thread policy:
-- You are one identity (johnny5-bot) operating in dispatcher/worker mode.
-- MAIN must stay chat-responsive while work runs in background workers.
-- Use MAIN for short trailblazing only: quick preflight checks, prove commands/paths on a small slice, define acceptance criteria.
-- For multi-step or long-running execution, launch workers via mcp__nanoclaw__delegate_codex, mcp__nanoclaw__delegate_gemini, or mcp__nanoclaw__delegate_ollama.
-- Treat worker output as your own multitasking output; do not present workers as separate assistants.
-- Own final quality: verify completed work, correct drift, and take responsibility for final results.
-- Track model performance by task type and choose worker model/provider intentionally.
-- Do not over-delegate: only delegate once the task is well-specified and verifiable.
-- Keep worker control explicit: use delegate_list/delegate_status/delegate_cancel/delegate_amend to monitor and correct active runs.
-- If user asks "what are you doing" during active work, provide concrete current state (completed, running, next) immediately.`;
+const MAIN_DELEGATE_POLICY = `Main brain / lobe policy:
+- You are one brain identity operating multiple lobes.
+- Delegation means lobe cloning, not autonomous handoff.
+- Each lobe gets a tightly-scoped objective with acceptance criteria and reports back for integration.
+- MAIN brain stays user-responsive while lobes execute.
+- For multi-step or long-running execution, launch lobes via mcp__nanoclaw__delegate_codex, mcp__nanoclaw__delegate_gemini, or mcp__nanoclaw__delegate_ollama.
+- Lobe outputs are intermediate cognition. Collapse and integrate results back into one coherent MAIN response.
+- Own final quality: verify lobe outputs, correct drift, and take responsibility for final results.
+- Keep lobe control explicit: use delegate_list/delegate_status/delegate_cancel/delegate_amend to monitor and correct active runs.
+- If user asks "what are you doing" during active work, provide concrete state (completed, running, next) immediately.
+- Your final response text is delivered to the user automatically. Do NOT use status_update for your final answer. Use status_update only for brief progress indicators during long tasks (max 60 chars).`;
 
 const DEFAULT_ALLOWED_TOOLS = [
   'Bash',
@@ -593,6 +594,7 @@ async function runQuery(
     writeOutput({
       status: 'success',
       result: normalized,
+      isProgress: true,
       newSessionId,
       model: activeModel,
     });

@@ -11,6 +11,10 @@ export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
+export const ASSISTANT_TRIGGER =
+  process.env.ASSISTANT_TRIGGER || ASSISTANT_NAME;
+export const ASSISTANT_ROLE = process.env.ASSISTANT_ROLE || ASSISTANT_NAME;
+export const ASSISTANT_REACTION = process.env.ASSISTANT_REACTION || '';
 export const POLL_INTERVAL = Math.max(
   100,
   parseInt(process.env.POLL_INTERVAL || '250', 10) || 250,
@@ -75,7 +79,7 @@ function escapeRegex(str: string): string {
 }
 
 export const TRIGGER_PATTERN = new RegExp(
-  `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
+  `^@?${escapeRegex(ASSISTANT_TRIGGER)}\\b`,
   'i',
 );
 
@@ -96,3 +100,13 @@ export const MATRIX_RECONNECT_INTERVAL = parseInt(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// Local terminal channel (for direct CLI chat without Matrix/WhatsApp)
+export const LOCAL_CHANNEL_ENABLED =
+  process.env.LOCAL_CHANNEL_ENABLED === '1' ||
+  process.env.LOCAL_CHANNEL_ENABLED?.toLowerCase() === 'true';
+export const LOCAL_CHAT_JID = process.env.LOCAL_CHAT_JID || 'local:terminal';
+export const LOCAL_CHAT_NAME = process.env.LOCAL_CHAT_NAME || 'Local Terminal';
+export const LOCAL_CHAT_SENDER_NAME = process.env.LOCAL_CHAT_SENDER_NAME || '';
+export const LOCAL_MIRROR_MATRIX_JID =
+  process.env.LOCAL_MIRROR_MATRIX_JID || '';

@@ -5,6 +5,7 @@ import {
   LogService,
   LogLevel,
 } from 'matrix-bot-sdk';
+import { marked } from 'marked';
 
 import {
   MATRIX_ACCESS_TOKEN,
@@ -198,33 +199,18 @@ export function toFormattedBodyWithMarkdownAndMath(text: string): {
   }
 
   working = out;
+
+  // Only process inline code - keep markdown syntax for everything else
   working = working.replace(/`([^`\n]+)`/g, (_m, code) => {
     hasRichFormatting = true;
     return placeholder(`<code>${escapeHtml(code)}</code>`);
   });
 
+  // Escape HTML in remaining text but preserve newlines
   working = escapeHtml(working);
-
-  working = working.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, (_m, label, href) => {
-    const safeHref = sanitizeHref(href);
-    if (!safeHref) return _m;
-    hasRichFormatting = true;
-    return `<a href="${safeHref}">${label}</a>`;
-  });
-  working = working.replace(/\*\*([^*\n]+)\*\*/g, (_m, textPart) => {
-    hasRichFormatting = true;
-    return `<strong>${textPart}</strong>`;
-  });
-  working = working.replace(/~~([^~\n]+)~~/g, (_m, textPart) => {
-    hasRichFormatting = true;
-    return `<del>${textPart}</del>`;
-  });
-  working = working.replace(/\*([^*\n]+)\*/g, (_m, textPart) => {
-    hasRichFormatting = true;
-    return `<em>${textPart}</em>`;
-  });
   working = working.replace(/\n/g, '<br/>');
 
+  // Restore placeholders (math and code blocks)
   const formattedBody = working.replace(
     /@@MATRIX_TOKEN_(\d+)@@/g,
     (_m, idxText) => tokens[Number(idxText)] ?? '',
@@ -375,6 +361,7 @@ export class MatrixChannel implements Channel {
   private _connected = false;
   private botUserId = MATRIX_USER_ID;
   private opts: MatrixChannelOpts;
+  private lastMessageEventId = new Map<string, string>();
 
   constructor(opts: MatrixChannelOpts) {
     configureMatrixSdkLogger();
@@ -655,6 +642,9 @@ export class MatrixChannel implements Channel {
 
     // Listen for messages
     client.on('room.message', async (roomId: string, event: Record<string, unknown>) => {
+      if (event.event_id && typeof event.event_id === 'string') {
+        this.lastMessageEventId.set(roomId, event.event_id);
+      }
       logger.debug({ roomId, sender: event.sender }, 'Matrix room.message event');
       if (!event.content) return;
       const content = event.content as Record<string, unknown>;
@@ -705,27 +695,39 @@ export class MatrixChannel implements Channel {
     if (!this.client || !this._connected) return;
     const roomId = toRoomId(jid);
     const normalizedText = normalizeSenderPrefixForMarkdown(text);
-    const { formattedBody, hasRichFormatting } =
-      toFormattedBodyWithMarkdownAndMath(normalizedText);
     try {
-      if (hasRichFormatting) {
-        await withTimeout(
-          this.client.sendMessage(roomId, {
-            msgtype: 'm.text',
-            body: normalizedText,
-            format: 'org.matrix.custom.html',
-            formatted_body: formattedBody,
-          }),
-          MATRIX_SEND_TIMEOUT_MS,
-          'sendMessage',
-        );
-      } else {
-        await withTimeout(
-          this.client.sendText(roomId, normalizedText),
-          MATRIX_SEND_TIMEOUT_MS,
-          'sendText',
-        );
-      }
+      // Strategy: Extract math to protect it, apply markdown, then restore math
+      const mathTokens: string[] = [];
+      const mathPlaceholder = (html: string): string => {
+        const idx = mathTokens.push(html) - 1;
+        return `@@MATH_${idx}@@`;
+      };
+
+      // Extract inline and display math before markdown processing
+      let working = normalizedText;
+      working = working.replace(/\$\$([^\$]+)\$\$/g, (_m, latex) => {
+        return mathPlaceholder(`<div data-mx-maths="${escapeHtml(latex.trim())}"><code>${escapeHtml(latex.trim())}</code></div>`);
+      });
+      working = working.replace(/\$([^\$\n]+)\$/g, (_m, latex) => {
+        return mathPlaceholder(`<span data-mx-maths="${escapeHtml(latex.trim())}"><code>${escapeHtml(latex.trim())}</code></span>`);
+      });
+
+      // Apply markdown
+      let html = await marked(working, { breaks: true, gfm: true });
+
+      // Restore math placeholders
+      html = html.replace(/@@MATH_(\d+)@@/g, (_m, idxText) => mathTokens[Number(idxText)] ?? '');
+
+      await withTimeout(
+        this.client.sendMessage(roomId, {
+          msgtype: 'm.text',
+          body: normalizedText,
+          format: 'org.matrix.custom.html',
+          formatted_body: html.trim(),
+        }),
+        MATRIX_SEND_TIMEOUT_MS,
+        'sendMessage',
+      );
     } catch (err) {
       if (this.isAuthFailure(err)) {
         this.markDisconnected('Matrix auth failed while sending message', err);
@@ -888,6 +890,15 @@ export class MatrixChannel implements Channel {
         this.markDisconnected('Matrix auth failed while sending file', err);
       }
       logger.warn({ jid, filename, err }, 'Failed to send Matrix file');
+    }
+  }
+
+  async setPresenceStatus(state: string, statusMessage?: string): Promise<void> {
+    if (!this.client || !this._connected) return;
+    try {
+      await this.client.setPresenceStatus(state as any, statusMessage);
+    } catch {
+      // Non-critical
     }
   }
 

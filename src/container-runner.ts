@@ -19,6 +19,7 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
 } from './config.js';
+import { isPodmanRuntime, containerCli } from './container-runtime.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 import { validateAdditionalMounts } from './mount-security.js';
@@ -92,13 +93,6 @@ const CERT_PATH_ENV_VARS = [
   'GIT_SSL_CAINFO',
 ] as const;
 
-function isPodmanRuntime(): boolean {
-  return CONTAINER_RUNTIME === 'podman';
-}
-
-function containerCli(): 'container' | 'podman' {
-  return isPodmanRuntime() ? 'podman' : 'container';
-}
 
 function parseEnvLine(line: string): [string, string] | null {
   const trimmed = line.trim();

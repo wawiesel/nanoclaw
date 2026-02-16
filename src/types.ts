@@ -98,6 +98,8 @@ export interface Channel {
   // Telegram bots already display their name, so they return false.
   // WhatsApp returns true. Default true if not implemented.
   prefixAssistantName?: boolean;
+  // Optional: set presence/status visible next to bot display name
+  setPresenceStatus?(state: string, statusMessage?: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

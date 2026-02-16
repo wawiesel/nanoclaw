@@ -1,4 +1,3 @@
-import { execSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -7,8 +6,6 @@ import {
   ASSISTANT_REACTION,
   ASSISTANT_ROLE,
   ASSISTANT_TRIGGER,
-  CONTAINER_IMAGE,
-  CONTAINER_RUNTIME,
   DATA_DIR,
   GROUPS_DIR,
   HEAP_LIMIT_MB,
@@ -24,16 +21,28 @@ import {
   MATRIX_USERNAME,
   MEMORY_CHECK_INTERVAL,
   POLL_INTERVAL,
+  STORE_DIR,
   TRIGGER_PATTERN,
 } from './config.js';
 import { LocalCliChannel } from './channels/local-cli.js';
 import { MatrixChannel } from './channels/matrix.js';
+import { WhatsAppChannel } from './channels/whatsapp.js';
+import {
+  isCrossBotRoom,
+  shouldIgnoreMessage,
+  forwardCrossBotMessages,
+} from './cross-bot.js';
 import {
   ContainerOutput,
   runContainerAgent,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
+import {
+  ensureContainerSystemRunning,
+  hasRuntimeActiveContainer,
+  runtimeHealthy,
+} from './container-runtime.js';
 import {
   getAllChats,
   getAllRegisteredGroups,
@@ -609,73 +618,11 @@ function buildMainMissionContext(chatJid: string): string | undefined {
   ].join('\n');
 }
 
-function runtimeHealthy(): boolean {
-  if (CONTAINER_RUNTIME === 'podman') {
-    return canReachPodmanApi();
-  }
-
-  try {
-    execSync('container system status', { stdio: 'pipe' });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function hasRuntimeActiveGroupRun(chatJid: string): boolean {
   const group = registeredGroups[chatJid];
   if (!group) return false;
-
   const safeFolder = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-  const runtimeBotTag = (ASSISTANT_NAME || 'bot').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-  const prefix = `nanoclaw-${runtimeBotTag}-${safeFolder}-`;
-
-  if (CONTAINER_RUNTIME === 'podman') {
-    try {
-      const output = execSync('podman ps --format json', {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        encoding: 'utf-8',
-      });
-      const parsed: unknown = JSON.parse(output || '[]');
-      if (!Array.isArray(parsed)) return false;
-      return parsed.some((entry) => {
-        if (!entry || typeof entry !== 'object') return false;
-        const record = entry as Record<string, unknown>;
-        const namesRaw = record.Names ?? record.Name;
-        const names = Array.isArray(namesRaw)
-          ? namesRaw.filter((n): n is string => typeof n === 'string')
-          : typeof namesRaw === 'string'
-            ? [namesRaw]
-            : [];
-        return names.some((n) => n.startsWith(prefix));
-      });
-    } catch {
-      return false;
-    }
-  }
-
-  try {
-    const output = execSync('container ls --format json', {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const parsed: unknown = JSON.parse(output || '[]');
-    if (!Array.isArray(parsed)) return false;
-    return parsed.some((entry) => {
-      if (!entry || typeof entry !== 'object') return false;
-      const record = entry as {
-        status?: string;
-        configuration?: { id?: string };
-      };
-      return (
-        record.status === 'running' &&
-        typeof record.configuration?.id === 'string' &&
-        record.configuration.id.startsWith(prefix)
-      );
-    });
-  } catch {
-    return false;
-  }
+  return hasRuntimeActiveContainer(safeFolder);
 }
 
 function heartbeatTextForChat(chatJid: string, includeTodoReminder = false): string {
@@ -778,6 +725,9 @@ function ensureGroupForIncomingChat(
   chatJid: string,
   chatName?: string,
 ): void {
+  // Never auto-register the cross-bot room — we only send there, never listen
+  if (isCrossBotRoom(chatJid)) return;
+
   if (registeredGroups[chatJid]) {
     if (
       LOCAL_CHANNEL_ENABLED &&
@@ -1221,13 +1171,32 @@ async function startMessageLoop(): Promise<void> {
           if (!group) continue;
 
           const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
+
+          // Filter out other-bot noise; everything else gets processed
+          const filtered = groupMessages.filter((msg) => !shouldIgnoreMessage(msg));
+          if (filtered.length === 0) continue;
+
+          // Cross-bot @mention forwarding: messages matching @OtherBot
+          // get forwarded to the other bot's room
+          const forThisBot = await forwardCrossBotMessages(
+            chatJid,
+            filtered,
+            group.name,
+            (jid) => findChannel(channels, jid),
+          );
+          if (forThisBot.length === 0) {
+            lastAgentTimestamp[chatJid] = groupMessages[groupMessages.length - 1].timestamp;
+            saveState();
+            continue;
+          }
+
           const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
 
           // For non-main groups, only act on trigger messages.
           // Non-trigger messages accumulate in DB and get pulled as
           // context when a trigger eventually arrives.
           if (needsTrigger) {
-            const hasTrigger = groupMessages.some((m) =>
+            const hasTrigger = forThisBot.some((m) =>
               TRIGGER_PATTERN.test(m.content.trim()),
             );
             if (!hasTrigger) continue;
@@ -1390,274 +1359,6 @@ function recoverPendingMessages(): void {
   }
 }
 
-type PodmanMachineListEntry = {
-  Name: string;
-  Default?: boolean;
-  Running?: boolean;
-  Starting?: boolean;
-};
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function canReachPodmanApi(): boolean {
-  try {
-    execSync('podman info', { stdio: 'pipe' });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function podmanCommandSucceeded(args: string[]): boolean {
-  const result = spawnSync('podman', args, { stdio: 'ignore' });
-  return result.status === 0;
-}
-
-function ensurePodmanImageAvailable(): void {
-  if (podmanCommandSucceeded(['image', 'exists', CONTAINER_IMAGE])) {
-    logger.debug({ image: CONTAINER_IMAGE }, 'Podman image available');
-    return;
-  }
-
-  const dockerfilePath = path.join(process.cwd(), 'container', 'Dockerfile');
-  const buildContext = path.join(process.cwd(), 'container');
-  if (!fs.existsSync(dockerfilePath) || !fs.existsSync(buildContext)) {
-    throw new Error(
-      `Container image ${CONTAINER_IMAGE} missing and build context not found`,
-    );
-  }
-
-  logger.warn({ image: CONTAINER_IMAGE }, 'Podman image missing; rebuilding');
-  const buildResult = spawnSync(
-    'podman',
-    ['build', '-t', CONTAINER_IMAGE, '-f', dockerfilePath, buildContext],
-    {
-      stdio: 'inherit',
-      timeout: 30 * 60 * 1000,
-    },
-  );
-
-  if (buildResult.error) {
-    throw new Error(
-      `Failed to rebuild container image ${CONTAINER_IMAGE}: ${buildResult.error.message}`,
-    );
-  }
-
-  if (buildResult.status !== 0) {
-    throw new Error(
-      `Failed to rebuild container image ${CONTAINER_IMAGE} (exit code ${buildResult.status ?? 'unknown'})`,
-    );
-  }
-
-  if (!podmanCommandSucceeded(['image', 'exists', CONTAINER_IMAGE])) {
-    throw new Error(
-      `Container image ${CONTAINER_IMAGE} is still missing after rebuild`,
-    );
-  }
-
-  logger.info({ image: CONTAINER_IMAGE }, 'Podman image rebuilt and ready');
-}
-
-async function waitForPodmanApi(timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (canReachPodmanApi()) return true;
-    await sleep(1000);
-  }
-  return canReachPodmanApi();
-}
-
-function getPodmanMachines(): PodmanMachineListEntry[] {
-  const output = execSync('podman machine list --format json', {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    encoding: 'utf-8',
-  });
-  const parsed: unknown = JSON.parse(output || '[]');
-  if (!Array.isArray(parsed)) return [];
-  return parsed.filter(
-    (item): item is PodmanMachineListEntry =>
-      !!item &&
-      typeof item === 'object' &&
-      'Name' in item &&
-      typeof (item as { Name: unknown }).Name === 'string',
-  );
-}
-
-function selectPodmanMachine(machines: PodmanMachineListEntry[]): PodmanMachineListEntry | undefined {
-  return machines.find((m) => m.Default) || machines[0];
-}
-
-async function ensurePodmanRuntimeAvailable(): Promise<void> {
-  if (await waitForPodmanApi(2000)) {
-    logger.debug('Podman runtime available');
-    return;
-  }
-
-  logger.warn('Podman runtime unavailable; attempting machine recovery');
-
-  let machineName = 'podman-machine-default';
-  try {
-    const machine = selectPodmanMachine(getPodmanMachines());
-    if (!machine) {
-      throw new Error('No podman machine exists. Run: podman machine init');
-    }
-    machineName = machine.Name;
-    if (machine.Starting && !machine.Running) {
-      logger.warn({ machineName }, 'Podman machine stuck in starting state; forcing stop');
-      try {
-        execSync(`podman machine stop ${machineName}`, { stdio: 'pipe', timeout: 30000 });
-      } catch {
-        // Best effort: a stale "starting" state may not stop cleanly.
-      }
-    } else if (machine.Running) {
-      logger.warn({ machineName }, 'Podman machine reports running but API is unavailable; restarting');
-      try {
-        execSync(`podman machine stop ${machineName}`, { stdio: 'pipe', timeout: 30000 });
-      } catch {
-        // Best effort before restart.
-      }
-    }
-
-    execSync(`podman machine start ${machineName}`, { stdio: 'pipe', timeout: 180000 });
-  } catch (err) {
-    logger.error({ err, machineName }, 'Failed to start Podman machine');
-    throw err;
-  }
-
-  if (await waitForPodmanApi(120000)) {
-    logger.info({ machineName }, 'Podman runtime recovered');
-    return;
-  }
-
-  throw new Error('Podman machine started but API did not become ready');
-}
-
-function cleanupOrphanedPodmanContainers(): void {
-  try {
-    const output = execSync('podman ps --format json', {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const containers: Array<{ Names?: string[] | string }> = JSON.parse(
-      output || '[]',
-    );
-    const names = containers.flatMap((c) => {
-      if (Array.isArray(c.Names)) return c.Names;
-      return c.Names ? [c.Names] : [];
-    });
-    const botTag = (ASSISTANT_NAME || 'bot').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-    const ownPrefix = `nanoclaw-${botTag}-`;
-    const orphans = names.filter((n) => n.startsWith(ownPrefix));
-    for (const name of orphans) {
-      try {
-        execSync(`podman stop -t 1 ${name}`, { stdio: 'pipe' });
-      } catch {
-        // Best-effort cleanup
-      }
-    }
-    if (orphans.length > 0) {
-      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned podman containers');
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to clean up orphaned podman containers');
-  }
-}
-
-async function ensureContainerSystemRunning(): Promise<void> {
-  if (CONTAINER_RUNTIME === 'podman') {
-    try {
-      await ensurePodmanRuntimeAvailable();
-      cleanupOrphanedPodmanContainers();
-      ensurePodmanImageAvailable();
-    } catch (err) {
-      logger.error({ err }, 'Podman runtime/image setup failed');
-      console.error(
-        '\n╔════════════════════════════════════════════════════════════════╗',
-      );
-      console.error(
-        '║  FATAL: Podman setup failed                                     ║',
-      );
-      console.error(
-        '║                                                                ║',
-      );
-      console.error(
-        '║  Could not start Podman runtime or prepare container image.    ║',
-      );
-      console.error(
-        '║  Check: podman machine list / podman machine start             ║',
-      );
-      console.error(
-        '╚════════════════════════════════════════════════════════════════╝\n',
-      );
-      throw new Error('Podman is required but not available');
-    }
-    return;
-  }
-
-  try {
-    execSync('container system status', { stdio: 'pipe' });
-    logger.debug('Apple Container system already running');
-  } catch {
-    logger.info('Starting Apple Container system...');
-    try {
-      execSync('container system start', { stdio: 'pipe', timeout: 30000 });
-      logger.info('Apple Container system started');
-    } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
-      console.error(
-        '\n╔════════════════════════════════════════════════════════════════╗',
-      );
-      console.error(
-        '║  FATAL: Apple Container system failed to start                 ║',
-      );
-      console.error(
-        '║                                                                ║',
-      );
-      console.error(
-        '║  Agents cannot run without Apple Container system.             ║',
-      );
-      console.error(
-        '║  Install from: https://github.com/apple/container              ║',
-      );
-      console.error(
-        '║  Then run: container system start                              ║',
-      );
-      console.error(
-        '║  Then restart NanoClaw                                         ║',
-      );
-      console.error(
-        '╚════════════════════════════════════════════════════════════════╝\n',
-      );
-      throw new Error('Apple Container system is required but not running');
-    }
-  }
-
-  // Kill and clean up orphaned NanoClaw containers from previous runs
-  try {
-    const output = execSync('container ls --format json', {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
-    const acBotTag = (ASSISTANT_NAME || 'bot').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-    const acOwnPrefix = `nanoclaw-${acBotTag}-`;
-    const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith(acOwnPrefix))
-      .map((c) => c.configuration.id);
-    for (const name of orphans) {
-      try {
-        execSync(`container stop ${name}`, { stdio: 'pipe' });
-      } catch { /* already stopped */ }
-    }
-    if (orphans.length > 0) {
-      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to clean up orphaned containers');
-  }
-}
 
 /**
  * After any restart, inject a synthetic message into the main chat
@@ -1728,6 +1429,23 @@ async function main(): Promise<void> {
     });
   }
 
+  // Create WhatsApp channel (activates only if auth store exists)
+  let whatsapp: WhatsAppChannel | null = null;
+  const waAuthDir = path.join(STORE_DIR, 'auth');
+  if (fs.existsSync(waAuthDir)) {
+    whatsapp = new WhatsAppChannel({
+      onMessage: (_chatJid, msg) => {
+        ensureGroupForIncomingChat(msg.chat_jid, msg.chat_name);
+        storeMessage(msg);
+      },
+      onChatMetadata: (chatJid, timestamp, name) => {
+        ensureGroupForIncomingChat(chatJid, name);
+        storeChatMetadata(chatJid, timestamp, name);
+      },
+      registeredGroups: () => registeredGroups,
+    });
+  }
+
   let localCli: LocalCliChannel | null = null;
   if (LOCAL_CHANNEL_ENABLED) {
     localCli = new LocalCliChannel({
@@ -1747,7 +1465,7 @@ async function main(): Promise<void> {
   }
 
   // Build channels array (only include connected channels)
-  const allChannels: (Channel | null)[] = [localCli, matrix];
+  const allChannels: (Channel | null)[] = [localCli, matrix, whatsapp];
   const refreshConnectedChannels = () => {
     channels = allChannels.filter((ch): ch is Channel => ch != null && ch.isConnected());
   };
@@ -1789,6 +1507,17 @@ async function main(): Promise<void> {
         matrixReconnectInProgress = false;
       }
     }, MATRIX_RECONNECT_INTERVAL);
+  }
+
+  // Connect WhatsApp (blocks until QR auth or existing session loads)
+  if (whatsapp) {
+    try {
+      await whatsapp.connect();
+      refreshConnectedChannels();
+      logger.info('WhatsApp connected');
+    } catch (err) {
+      logger.error({ err }, 'WhatsApp connection failed');
+    }
   }
 
   // Memory watchdog — gracefully recycle before OOM

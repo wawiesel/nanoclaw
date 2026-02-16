@@ -11,6 +11,7 @@ import {
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import { processExtendedTaskIpc } from './ipc-extensions.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
@@ -422,7 +423,18 @@ export async function processTaskIpc(
       }
       break;
 
-    default:
-      logger.warn({ type: data.type }, 'Unknown IPC task type');
+    default: {
+      // Delegate to extended IPC handlers (deploy, restart, brain mode, etc.)
+      const handled = await processExtendedTaskIpc(
+        data,
+        isMain,
+        sourceGroup,
+        { sendMessage: deps.sendMessage },
+      );
+      if (!handled) {
+        logger.warn({ type: data.type }, 'Unknown IPC task type');
+      }
+      break;
+    }
   }
 }
